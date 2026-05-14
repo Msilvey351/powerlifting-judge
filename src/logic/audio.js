@@ -1,8 +1,9 @@
+// src/logic/audio.js
 const MIN_INTERVAL_MS = 2000
-const lastPlayed = {}
-let debugCallback = null
-let audioContext = null
-const audioBuffers = {}
+const lastPlayed      = {}
+let debugCallback     = null
+let audioContext      = null
+const audioBuffers    = {}
 
 export function setAudioDebug(callback) {
   debugCallback = callback
@@ -24,7 +25,9 @@ export async function initAudio() {
       log(`AudioContext resumed, state: ${audioContext.state}`)
     }
 
-    const files = ['squat', 'rack', 'down']
+    // ── 'start' added for bench press ────────────────────────────────────────
+    const files = ['squat', 'rack', 'down', 'start']
+
     await Promise.all(files.map(async (name) => {
       try {
         log(`fetching ${name}...`)
@@ -74,8 +77,8 @@ export function speakCommand(command) {
   }
 
   try {
-    const source = audioContext.createBufferSource()
-    source.buffer = buffer
+    const source    = audioContext.createBufferSource()
+    source.buffer   = buffer
     source.connect(audioContext.destination)
     source.start(0)
     log(`playing OK: ${command}`)

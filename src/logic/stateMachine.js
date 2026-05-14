@@ -1,6 +1,7 @@
 import { computeAngles, checkDepth, pickBestSide,
          lateralityScore, classifyCamera,
-         handFootDistance } from './poseUtils.js'
+         handFootDistance, euclideanDistance,
+         benchPickBestSide, computeElbowAngle } from './poseUtils.js'
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
 export const SquatState = {
@@ -609,6 +610,357 @@ export class DeadliftReferee {
       side,
       camera,
       angles,
+    }
+  }
+}
+
+
+// ── Bench Press States ────────────────────────────────────────────────────────
+export const BenchState = {
+  WAITING:     'WAITING',
+  SETUP:       'SETUP',
+  LOCKOUT:     'LOCKOUT',
+  DESCENDING:  'DESCENDING',
+  CHEST:       'CHEST',
+  PRESSING:    'PRESSING',
+  COMPLETE:    'COMPLETE',
+}
+
+export const BENCH_STATE_MESSAGES = {
+  [BenchState.WAITING]:    'READY — Lie in frame',
+  [BenchState.SETUP]:      'DETECTED — Hold still',
+  [BenchState.LOCKOUT]:    'HOLD — Arms locked out',
+  [BenchState.DESCENDING]: 'DESCENDING ▼',
+  [BenchState.CHEST]:      'CHEST — Hold still',
+  [BenchState.PRESSING]:   'PRESS ▲',
+  [BenchState.COMPLETE]:   'SET COMPLETE',
+}
+
+// ── BenchReferee ──────────────────────────────────────────────────────────────
+export class BenchReferee {
+  constructor(onCommand, totalReps = 1, angle = 'side', calibration = null) {
+    // ── Thresholds ──────────────────────────────────────────────────────────
+    this.ELBOW_LOCK_ANGLE      = 160   // elbow angle >= this → arms locked out
+    this.ELBOW_LOCK_TOLERANCE  = 5     // degrees of tolerance when re-checking lockout
+    this.CHEST_RATIO_TOLERANCE = 0.06  // arm ratio tolerance for chest contact
+    this.VELOCITY_THRESHOLD    = 0.004 // wrist movement per frame (normalised coords)
+    this.LOCKOUT_HOLD_FRAMES   = 20    // frames still at lockout before START fires
+    this.CHEST_HOLD_FRAMES     = 15    // frames still at chest before PRESS fires
+    this.SETUP_HOLD_FRAMES     = 25    // frames still at lockout before first START
+
+    // ── Config ──────────────────────────────────────────────────────────────
+    this.onCommand  = onCommand
+    this.totalReps  = totalReps
+    this.angle      = angle.toLowerCase()
+
+    // calibration = { chestRatio, armExtendedDistance, side }
+    // null = no calibration, fall back to elbow-angle-only chest detection
+    this.calibration = calibration
+
+    this._reset()
+  }
+
+  // ── Reset ─────────────────────────────────────────────────────────────────
+  _reset() {
+    this.state      = BenchState.WAITING
+    this.result     = LiftResult.PENDING
+    this.currentRep = 0
+    this.repResults = []
+    this._faults    = []
+    this._resetForNextRep()
+  }
+
+  reset() {
+    this._reset()
+    console.log('[RESET] Bench ready for next set.')
+  }
+
+  _resetForNextRep() {
+    this._faults             = []
+    this._lockoutFrames      = 0
+    this._chestFrames        = 0
+    this._commandFired       = false
+    this._elbowAngleHistory  = []   // for local-minimum detection
+    this._wristHistory       = []   // for velocity computation
+    this._descendStarted     = false
+    this._chestReached       = false
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  _addFault(fault) {
+    if (!this._faults.includes(fault)) {
+      this._faults.push(fault)
+      console.log(`[FAULT] Rep ${this.currentRep}: ${fault}`)
+    }
+  }
+
+  _giveCommand(command) {
+    this.onCommand(command)
+    console.log(`>>> ${command.toUpperCase()} <<<`)
+  }
+
+  _completeRep() {
+    const repResult = this._chestReached && this._faults.length === 0
+      ? LiftResult.WHITE
+      : LiftResult.RED
+
+    const reasons = this._chestReached
+      ? [...this._faults]
+      : ['Bar did not reach chest', ...this._faults]
+
+    this.repResults.push({
+      rep:    this.currentRep,
+      result: repResult,
+      faults: repResult === LiftResult.RED ? reasons : [],
+    })
+
+    console.log(
+      `[REP ${this.currentRep}] ${repResult}` +
+      (repResult === LiftResult.RED ? ' — ' + reasons.join(', ') : '')
+    )
+  }
+
+  // ── Wrist velocity ────────────────────────────────────────────────────────
+  // Returns the magnitude of wrist movement over the last 3 frames.
+  // Uses the calibrated side's wrist, or falls back to any visible wrist.
+  _updateWristHistory(landmarks, side) {
+    const wrist = landmarks[`${side}_wrist`]
+    if (!wrist) return Infinity
+
+    this._wristHistory.push({ x: wrist.x, y: wrist.y })
+    if (this._wristHistory.length > 5) this._wristHistory.shift()
+    if (this._wristHistory.length < 2) return Infinity
+
+    const prev = this._wristHistory[this._wristHistory.length - 2]
+    const curr = this._wristHistory[this._wristHistory.length - 1]
+    return Math.sqrt((curr.x - prev.x) ** 2 + (curr.y - prev.y) ** 2)
+  }
+
+  // ── Elbow angle local minimum ─────────────────────────────────────────────
+  // Returns true once the elbow angle has clearly started increasing again
+  // after a descent — i.e. the bar has bounced off the minimum.
+  _updateElbowHistory(elbowAngle) {
+    this._elbowAngleHistory.push(elbowAngle)
+    if (this._elbowAngleHistory.length > 8) this._elbowAngleHistory.shift()
+  }
+
+  _elbowAtLocalMinimum() {
+    const h = this._elbowAngleHistory
+    if (h.length < 4) return false
+    // minimum = last value is higher than minimum of previous values
+    const prev    = h.slice(0, -1)
+    const minPrev = Math.min(...prev)
+    return h[h.length - 1] > minPrev + 3  // 3° hysteresis
+  }
+
+  // ── Chest contact detection ───────────────────────────────────────────────
+  // Uses calibration (arm ratio) if available, elbow angle only if not.
+  _isAtChest(landmarks, side, elbowAngle, wristVelocity, barY) {
+    const wristStill = wristVelocity < this.VELOCITY_THRESHOLD
+
+    // if we have calibration data, use arm ratio as primary signal
+    if (this.calibration) {
+      const calSide  = this.calibration.side
+      const shoulder = landmarks[`${calSide}_shoulder`]
+      const wrist    = landmarks[`${calSide}_wrist`]
+
+      if (shoulder && wrist) {
+        const currentArmDist  = euclideanDistance(shoulder, wrist)
+        const currentRatio    = currentArmDist / this.calibration.armExtendedDistance
+        const ratioAtChest    = currentRatio <= this.calibration.chestRatio + this.CHEST_RATIO_TOLERANCE
+
+        // require ratio AND wrist stillness AND elbow at or near minimum
+        return ratioAtChest && wristStill && this._elbowAtLocalMinimum()
+      }
+    }
+
+    // fallback — no calibration: use elbow angle only
+    // bar is at chest when elbow is near its most bent point and wrist is still
+    return elbowAngle < 100 && wristStill && this._elbowAtLocalMinimum()
+  }
+
+  // ── Lockout detection ─────────────────────────────────────────────────────
+  _isLockedOut(elbowAngle) {
+    return elbowAngle >= this.ELBOW_LOCK_ANGLE
+  }
+
+  // ── Main update ───────────────────────────────────────────────────────────
+  // barY is passed in from CameraScreen (detected by barDetector).
+  // It may be null if bar detection hasn't found the bar yet.
+  update(landmarks, barY = null) {
+    const side = benchPickBestSide(landmarks)
+    if (!side) {
+      return {
+        state:      this.state,
+        result:     this.result,
+        progress:   0,
+        checks:     [],
+        currentRep: this.currentRep,
+        totalReps:  this.totalReps,
+        repResults: this.repResults,
+        side:       null,
+      }
+    }
+
+    const elbowAngle   = computeElbowAngle(landmarks, side)
+    if (elbowAngle === null) return this._emptyReturn()
+
+    const wristVelocity = this._updateWristHistory(landmarks, side)
+    const wristStill    = wristVelocity < this.VELOCITY_THRESHOLD
+    const lockedOut     = this._isLockedOut(elbowAngle)
+
+    this._updateElbowHistory(elbowAngle)
+
+    const atChest = this._isAtChest(landmarks, side, elbowAngle, wristVelocity, barY)
+
+    // ── State machine ───────────────────────────────────────────────────────
+    if (this.state === BenchState.WAITING) {
+      // Detect lifter lying down with arms extended
+      if (lockedOut) {
+        this.state          = BenchState.SETUP
+        this._lockoutFrames = 0
+      }
+
+    } else if (this.state === BenchState.SETUP) {
+      if (!lockedOut) {
+        // moved before command — back to waiting
+        this.state = BenchState.WAITING
+      } else if (wristStill) {
+        this._lockoutFrames++
+        if (this._lockoutFrames >= this.SETUP_HOLD_FRAMES) {
+          this.state = BenchState.LOCKOUT
+        }
+      } else {
+        this._lockoutFrames = Math.max(0, this._lockoutFrames - 1)
+      }
+
+    } else if (this.state === BenchState.LOCKOUT) {
+      if (!lockedOut) {
+        // started descending
+        this.currentRep++
+        this._giveCommand('start')
+        this._elbowAngleHistory = []
+        this._wristHistory      = []
+        this._descendStarted    = true
+        this.state              = BenchState.DESCENDING
+      } else if (wristStill && !this._commandFired) {
+        // first lockout START command fires once still
+        this._lockoutFrames++
+        if (this._lockoutFrames >= this.LOCKOUT_HOLD_FRAMES) {
+          this._commandFired  = true
+          this._lockoutFrames = 0
+        }
+      }
+
+    } else if (this.state === BenchState.DESCENDING) {
+      if (atChest) {
+        this._chestReached = true
+        this._chestFrames  = 0
+        this.state         = BenchState.CHEST
+      } else if (lockedOut && !this._descendStarted) {
+        // false positive — never actually descended
+        this.state = BenchState.LOCKOUT
+      }
+
+    } else if (this.state === BenchState.CHEST) {
+      if (!atChest && !wristStill) {
+        // bar has left chest — pressing
+        this.state = BenchState.PRESSING
+      } else if (wristStill) {
+        this._chestFrames++
+        if (this._chestFrames >= this.CHEST_HOLD_FRAMES) {
+          this._giveCommand('start')  // "press" command — using start.mp3
+          // Note: IPF uses "Press" command. Use press.mp3 when available.
+          // For now start.mp3 doubles as the press command.
+        }
+      }
+
+    } else if (this.state === BenchState.PRESSING) {
+      if (lockedOut) {
+        this.state          = BenchState.LOCKOUT
+        this._lockoutFrames = 0
+        this._commandFired  = false
+        this._descendStarted = false
+      }
+
+      // if bar drops back down during pressing, return to CHEST
+      if (atChest) {
+        this.state = BenchState.CHEST
+      }
+
+    } else if (this.state === BenchState.COMPLETE) {
+      // stay complete
+    }
+
+    // ── Final lockout: complete the rep ─────────────────────────────────────
+    // Handled inside LOCKOUT state when returning from PRESSING
+    if (this.state === BenchState.LOCKOUT && this._descendStarted) {
+      if (wristStill) {
+        this._lockoutFrames++
+        if (this._lockoutFrames >= this.LOCKOUT_HOLD_FRAMES && !this._commandFired) {
+          this._commandFired = true
+          this._completeRep()
+
+          if (this.currentRep >= this.totalReps) {
+            this._giveCommand('rack')
+            this.result = LiftResult.WHITE
+            this.state  = BenchState.COMPLETE
+          } else {
+            // more reps — fire START and go straight back to descending
+            this._giveCommand('start')
+            this._resetForNextRep()
+            this.currentRep++
+            this._elbowAngleHistory = []
+            this._wristHistory      = []
+            this.state              = BenchState.DESCENDING
+          }
+        }
+      } else {
+        this._lockoutFrames = Math.max(0, this._lockoutFrames - 1)
+      }
+    }
+
+    // ── Checks (displayed in StatusBar checklist) ───────────────────────────
+    const checks = [
+      { label: 'Arms locked',   passed: lockedOut                  },
+      { label: 'Wrist still',   passed: wristStill                 },
+      { label: 'Bar at chest',  passed: atChest                    },
+      { label: 'Calibrated',    passed: this.calibration !== null  },
+    ]
+
+    // progress bar — used for setup hold
+    const progress = this.state === BenchState.SETUP
+      ? this._lockoutFrames / this.SETUP_HOLD_FRAMES
+      : this.state === BenchState.CHEST
+        ? this._chestFrames / this.CHEST_HOLD_FRAMES
+        : 0
+
+    return {
+      state:      this.state,
+      result:     this.result,
+      progress,
+      checks,
+      currentRep: this.currentRep,
+      totalReps:  this.totalReps,
+      repResults: this.repResults,
+      side,
+      elbowAngle,
+      wristVelocity,
+      atChest,
+      barY,
+    }
+  }
+
+  _emptyReturn() {
+    return {
+      state:      this.state,
+      result:     this.result,
+      progress:   0,
+      checks:     [],
+      currentRep: this.currentRep,
+      totalReps:  this.totalReps,
+      repResults: this.repResults,
+      side:       null,
     }
   }
 }

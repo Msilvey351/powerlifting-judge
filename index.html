@@ -1,13 +1,22 @@
+<!-- index.html -->
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>powerlifting-judge</title>
+    <title>Powerlifting Judge</title>
   </head>
   <body>
     <div id="root"></div>
+
+    <!--
+      OpenCV.js — loaded async so it doesn't block the page.
+      Once the WASM runtime is ready, cv.onRuntimeInitialized fires.
+      barDetector.js waits for this before doing anything.
+    -->
+    <script async src="https://docs.opencv.org/4.8.0/opencv.js"
+            onload="window._opencvLoaded = true"></script>
+
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
