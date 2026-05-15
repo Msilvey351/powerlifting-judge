@@ -18,6 +18,16 @@ import {
 import StatusBar      from '../widgets/StatusBar'
 import ResultsOverlay from '../widgets/ResultsOverlay'
 
+// ── Utility — race a promise against a timeout ────────────────────────────────
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    )
+  ])
+}
+
 function CameraScreen() {
   const navigate                 = useNavigate()
   const { liftId, angle, reps }  = useParams()
@@ -89,14 +99,12 @@ function CameraScreen() {
 
             const landmarks = extractLandmarks(rawLandmarks)
 
-            // Bar detection for bench
             let barY = null
             if (isBench && barDetectorRef.current) {
               const wristY = landmarks.left_wrist?.y ?? landmarks.right_wrist?.y ?? null
               barY = barDetectorRef.current.processFrame(video, wristY)
             }
 
-            // State machine
             const update = isBench
               ? referee.update(landmarks, barY)
               : referee.update(landmarks)
@@ -142,8 +150,8 @@ function CameraScreen() {
       { video: true },
     ]
 
-    let stream     = null
-    let lastError  = null
+    let stream    = null
+    let lastError = null
 
     for (const constraints of attempts) {
       try {
@@ -164,21 +172,16 @@ function CameraScreen() {
 
     video.srcObject = stream
 
-    // Wait for video to be genuinely ready before starting loop
     await new Promise((resolve) => {
-      if (video.readyState >= 2) {
-        resolve()
-        return
-      }
+      if (video.readyState >= 2) { resolve(); return }
       video.onloadeddata = () => resolve()
-      // fallback timeout — if event never fires, start anyway after 3s
       setTimeout(resolve, 3000)
     })
 
     try {
       await video.play()
     } catch (err) {
-      console.warn('[CameraScreen] video.play() error (safe to ignore on some browsers):', err)
+      console.warn('[CameraScreen] video.play() warning:', err)
     }
 
     console.log('[CameraScreen] Camera ready, starting detection loop')
@@ -193,7 +196,6 @@ function CameraScreen() {
       console.log('[CameraScreen] Setup starting...')
       await initAudio()
 
-      // Build referee
       if (isBench) {
         const calibration      = lifterName ? getBenchCalibration(lifterName) : null
         refereeRef.current     = new BenchReferee(handleCommand, totalReps, angle, calibration)
@@ -204,30 +206,31 @@ function CameraScreen() {
         refereeRef.current = new SquatReferee(handleCommand, totalReps)
       }
 
-      console.log('[CameraScreen] Loading MediaPipe vision...')
+      const modelPath = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task'
+
       try {
+        console.log('[CameraScreen] Loading MediaPipe vision...')
         const vision = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
         )
         console.log('[CameraScreen] FilesetResolver ready, creating PoseLandmarker...')
 
         try {
-          poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
-            baseOptions: {
-              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-              delegate: 'GPU',
-            },
-            runningMode: 'VIDEO',
-            numPoses:    1,
-          })
+          // Race GPU init against 8 second timeout
+          poseLandmarkerRef.current = await withTimeout(
+            PoseLandmarker.createFromOptions(vision, {
+              baseOptions: { modelAssetPath: modelPath, delegate: 'GPU' },
+              runningMode: 'VIDEO',
+              numPoses:    1,
+            }),
+            8000,
+            'GPU delegate'
+          )
           console.log('[CameraScreen] PoseLandmarker ready (GPU)')
         } catch (gpuErr) {
-          console.warn('[CameraScreen] GPU failed, falling back to CPU:', gpuErr)
+          console.warn('[CameraScreen] GPU failed or timed out, falling back to CPU:', gpuErr.message)
           poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
-            baseOptions: {
-              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-              delegate: 'CPU',
-            },
+            baseOptions: { modelAssetPath: modelPath, delegate: 'CPU' },
             runningMode: 'VIDEO',
             numPoses:    1,
           })
