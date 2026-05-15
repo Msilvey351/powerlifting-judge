@@ -19,18 +19,18 @@ import StatusBar      from '../widgets/StatusBar'
 import ResultsOverlay from '../widgets/ResultsOverlay'
 
 function CameraScreen() {
-  const navigate                    = useNavigate()
-  const { liftId, angle, reps }     = useParams()
-  const [searchParams]              = useSearchParams()
-  const lifterName                  = searchParams.get('lifter') ?? null
+  const navigate                 = useNavigate()
+  const { liftId, angle, reps }  = useParams()
+  const [searchParams]           = useSearchParams()
+  const lifterName               = searchParams.get('lifter') ?? null
 
-  const videoRef               = useRef(null)
-  const canvasRef              = useRef(null)
-  const poseLandmarkerRef      = useRef(null)
-  const animationFrameRef      = useRef(null)
-  const refereeRef             = useRef(null)
-  const barDetectorRef         = useRef(null)   // only for bench
-  const repResultsRef          = useRef([])
+  const videoRef            = useRef(null)
+  const canvasRef           = useRef(null)
+  const poseLandmarkerRef   = useRef(null)
+  const animationFrameRef   = useRef(null)
+  const refereeRef          = useRef(null)
+  const barDetectorRef      = useRef(null)
+  const repResultsRef       = useRef([])
 
   const [status,      setStatus]      = useState('Loading pose detection...')
   const [cameraError, setCameraError] = useState(null)
@@ -50,14 +50,18 @@ function CameraScreen() {
     speakCommand(command)
   }, [])
 
-  // ── Detection loop ─────────────────────────────────────────────────────────
+  // ── Detection loop ──────────────────────────────────────────────────────────
   const startDetectionLoop = useCallback(() => {
     const video          = videoRef.current
     const canvas         = canvasRef.current
     const poseLandmarker = poseLandmarkerRef.current
     const referee        = refereeRef.current
-    if (!video || !canvas || !poseLandmarker || !referee) return
+    if (!video || !canvas || !poseLandmarker || !referee) {
+      console.warn('[CameraScreen] startDetectionLoop called but refs not ready')
+      return
+    }
 
+    console.log('[CameraScreen] Detection loop starting')
     const ctx          = canvas.getContext('2d')
     const drawingUtils = new DrawingUtils(ctx)
 
@@ -67,60 +71,59 @@ function CameraScreen() {
       ctx.clearRect(0, 0, canvas.width, canvas.height)
 
       if (video.readyState >= 2) {
-        const results = poseLandmarker.detectForVideo(video, performance.now())
+        try {
+          const results = poseLandmarker.detectForVideo(video, performance.now())
 
-        if (results.landmarks?.length > 0) {
-          const rawLandmarks = results.landmarks[0]
+          if (results.landmarks?.length > 0) {
+            const rawLandmarks = results.landmarks[0]
 
-          drawingUtils.drawConnectors(
-            rawLandmarks,
-            PoseLandmarker.POSE_CONNECTIONS,
-            { color: '#00FF00', lineWidth: 2 }
-          )
-          drawingUtils.drawLandmarks(
-            rawLandmarks,
-            { color: '#FF0000', lineWidth: 1, radius: 3 }
-          )
-
-          const landmarks = extractLandmarks(rawLandmarks)
-
-          // ── Bar detection for bench ──────────────────────────────────────
-          let barY = null
-          if (isBench && barDetectorRef.current) {
-            // Wrist Y used to define the ROI for Hough detection
-            const wristY = landmarks.left_wrist?.y ?? landmarks.right_wrist?.y ?? null
-            barY = barDetectorRef.current.processFrame(video, wristY)
-          }
-
-          // ── State machine update ─────────────────────────────────────────
-          const update = isBench
-            ? referee.update(landmarks, barY)
-            : referee.update(landmarks)
-
-          // Status bar
-          if (update.currentRep > 0) {
-            setStatus(
-              `Rep ${update.currentRep}/${totalReps} — ${stateMessages[update.state] ?? update.state}`
+            drawingUtils.drawConnectors(
+              rawLandmarks,
+              PoseLandmarker.POSE_CONNECTIONS,
+              { color: '#00FF00', lineWidth: 2 }
             )
-          } else {
-            setStatus(stateMessages[update.state] ?? update.state)
-          }
+            drawingUtils.drawLandmarks(
+              rawLandmarks,
+              { color: '#FF0000', lineWidth: 1, radius: 3 }
+            )
 
-          // Result freeze
-          if (update.result !== LiftResult.PENDING) {
-            setResult(prev => {
-              if (prev === LiftResult.PENDING) {
-                repResultsRef.current = update.repResults
-                setRepResults(update.repResults)
-              }
-              return update.result
-            })
-          } else {
-            setResult(LiftResult.PENDING)
-          }
+            const landmarks = extractLandmarks(rawLandmarks)
 
-        } else {
-          setStatus('READY — Get into position')
+            // Bar detection for bench
+            let barY = null
+            if (isBench && barDetectorRef.current) {
+              const wristY = landmarks.left_wrist?.y ?? landmarks.right_wrist?.y ?? null
+              barY = barDetectorRef.current.processFrame(video, wristY)
+            }
+
+            // State machine
+            const update = isBench
+              ? referee.update(landmarks, barY)
+              : referee.update(landmarks)
+
+            if (update.currentRep > 0) {
+              setStatus(`Rep ${update.currentRep}/${totalReps} — ${stateMessages[update.state] ?? update.state}`)
+            } else {
+              setStatus(stateMessages[update.state] ?? update.state)
+            }
+
+            if (update.result !== LiftResult.PENDING) {
+              setResult(prev => {
+                if (prev === LiftResult.PENDING) {
+                  repResultsRef.current = update.repResults
+                  setRepResults(update.repResults)
+                }
+                return update.result
+              })
+            } else {
+              setResult(LiftResult.PENDING)
+            }
+
+          } else {
+            setStatus('READY — Get into position')
+          }
+        } catch (err) {
+          console.error('[CameraScreen] Detection error:', err)
         }
       }
 
@@ -130,44 +133,70 @@ function CameraScreen() {
     detect()
   }, [totalReps, stateMessages, isBench])
 
-  // ── Start camera ───────────────────────────────────────────────────────────
+  // ── Start camera ────────────────────────────────────────────────────────────
   const startCamera = useCallback(async () => {
+    console.log('[CameraScreen] Starting camera...')
     const attempts = [
       { video: { facingMode: 'user' } },
       { video: { facingMode: 'environment' } },
       { video: true },
     ]
-    let lastError = null
+
+    let stream     = null
+    let lastError  = null
+
     for (const constraints of attempts) {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia(constraints)
-        const video  = videoRef.current
-        if (video) {
-          video.srcObject = stream
-          video.play().catch(() => {})
-          video.onloadedmetadata = () => {
-            setStatus('READY — Get into position')
-            startDetectionLoop()
-          }
-        }
-        return
+        stream = await navigator.mediaDevices.getUserMedia(constraints)
+        break
       } catch (err) {
         lastError = err
       }
     }
-    setCameraError(lastError.name + ': ' + lastError.message)
+
+    if (!stream) {
+      setCameraError(lastError.name + ': ' + lastError.message)
+      return
+    }
+
+    const video = videoRef.current
+    if (!video) return
+
+    video.srcObject = stream
+
+    // Wait for video to be genuinely ready before starting loop
+    await new Promise((resolve) => {
+      if (video.readyState >= 2) {
+        resolve()
+        return
+      }
+      video.onloadeddata = () => resolve()
+      // fallback timeout — if event never fires, start anyway after 3s
+      setTimeout(resolve, 3000)
+    })
+
+    try {
+      await video.play()
+    } catch (err) {
+      console.warn('[CameraScreen] video.play() error (safe to ignore on some browsers):', err)
+    }
+
+    console.log('[CameraScreen] Camera ready, starting detection loop')
+    setStatus('READY — Get into position')
+    startDetectionLoop()
+
   }, [startDetectionLoop])
 
-  // ── Load everything ────────────────────────────────────────────────────────
+  // ── Load everything ─────────────────────────────────────────────────────────
   useEffect(() => {
     const setup = async () => {
+      console.log('[CameraScreen] Setup starting...')
       await initAudio()
 
-      // Build correct referee
+      // Build referee
       if (isBench) {
-        // Load calibration if a lifter name was passed from CalibrationScreen
-        const calibration = lifterName ? getBenchCalibration(lifterName) : null
-        refereeRef.current   = new BenchReferee(handleCommand, totalReps, angle, calibration)
+        const calibration      = lifterName ? getBenchCalibration(lifterName) : null
+        refereeRef.current     = new BenchReferee(handleCommand, totalReps, angle, calibration)
         barDetectorRef.current = new BarDetector()
       } else if (isDeadlift) {
         refereeRef.current = new DeadliftReferee(handleCommand, totalReps, angle)
@@ -175,20 +204,40 @@ function CameraScreen() {
         refereeRef.current = new SquatReferee(handleCommand, totalReps)
       }
 
+      console.log('[CameraScreen] Loading MediaPipe vision...')
       try {
         const vision = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
         )
-        poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-            delegate: 'GPU',
-          },
-          runningMode: 'VIDEO',
-          numPoses:    1,
-        })
+        console.log('[CameraScreen] FilesetResolver ready, creating PoseLandmarker...')
+
+        try {
+          poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+              delegate: 'GPU',
+            },
+            runningMode: 'VIDEO',
+            numPoses:    1,
+          })
+          console.log('[CameraScreen] PoseLandmarker ready (GPU)')
+        } catch (gpuErr) {
+          console.warn('[CameraScreen] GPU failed, falling back to CPU:', gpuErr)
+          poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+              delegate: 'CPU',
+            },
+            runningMode: 'VIDEO',
+            numPoses:    1,
+          })
+          console.log('[CameraScreen] PoseLandmarker ready (CPU fallback)')
+        }
+
         await startCamera()
+
       } catch (err) {
+        console.error('[CameraScreen] Setup failed:', err)
         setCameraError('Failed to load: ' + err.message)
       }
     }
@@ -202,9 +251,8 @@ function CameraScreen() {
     }
   }, [handleCommand, startCamera, totalReps, isBench, isDeadlift, angle, lifterName])
 
-  // ── Handlers ───────────────────────────────────────────────────────────────
-  const handleBack = () => navigate('/')
-
+  // ── Handlers ────────────────────────────────────────────────────────────────
+  const handleBack    = () => navigate('/')
   const handleDismiss = () => {
     setResult(LiftResult.PENDING)
     setRepResults([])
@@ -213,7 +261,7 @@ function CameraScreen() {
     navigate('/')
   }
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div style={styles.container}>
       <div style={styles.topBar}>
