@@ -18,16 +18,6 @@ import {
 import StatusBar      from '../widgets/StatusBar'
 import ResultsOverlay from '../widgets/ResultsOverlay'
 
-// ── Utility — race a promise against a timeout ────────────────────────────────
-function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
-    )
-  ])
-}
-
 function CameraScreen() {
   const navigate                 = useNavigate()
   const { liftId, angle, reps }  = useParams()
@@ -213,30 +203,18 @@ function CameraScreen() {
         const vision = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
         )
-        console.log('[CameraScreen] FilesetResolver ready, creating PoseLandmarker...')
+        console.log('[CameraScreen] FilesetResolver ready, creating PoseLandmarker (CPU)...')
 
-        try {
-          // Race GPU init against 8 second timeout
-          poseLandmarkerRef.current = await withTimeout(
-            PoseLandmarker.createFromOptions(vision, {
-              baseOptions: { modelAssetPath: modelPath, delegate: 'GPU' },
-              runningMode: 'VIDEO',
-              numPoses:    1,
-            }),
-            8000,
-            'GPU delegate'
-          )
-          console.log('[CameraScreen] PoseLandmarker ready (GPU)')
-        } catch (gpuErr) {
-          console.warn('[CameraScreen] GPU failed or timed out, falling back to CPU:', gpuErr.message)
-          poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
-            baseOptions: { modelAssetPath: modelPath, delegate: 'CPU' },
-            runningMode: 'VIDEO',
-            numPoses:    1,
-          })
-          console.log('[CameraScreen] PoseLandmarker ready (CPU fallback)')
-        }
+        poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: modelPath,
+            delegate:       'CPU',
+          },
+          runningMode: 'VIDEO',
+          numPoses:    1,
+        })
 
+        console.log('[CameraScreen] PoseLandmarker ready')
         await startCamera()
 
       } catch (err) {
