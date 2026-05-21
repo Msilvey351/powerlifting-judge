@@ -201,13 +201,13 @@ function CameraScreen() {
       try {
         console.log('[CameraScreen] Loading MediaPipe vision...')
         const vision = await FilesetResolver.forVisionTasks(
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/wasm'
         )
         console.log('[CameraScreen] FilesetResolver ready, creating PoseLandmarker (CPU)...')
 
         poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
           baseOptions: {
-            modelAssetPath: modelPath,
+            modelAssetPath: '/models/pose_landmarker_lite.task',
             delegate:       'CPU',
           },
           runningMode: 'VIDEO',
