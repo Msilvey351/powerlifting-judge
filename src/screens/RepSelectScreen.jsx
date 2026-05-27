@@ -30,6 +30,11 @@ function RepSelectScreen() {
       setError('Please enter a number between 1 and 15')
       return
     }
+    if (liftId === 'bench'){
+      navigate('/calibrate/${liftId}/${angle}/${num}')
+    } else{
+      navigate(`/camera/${liftId}/${angle}/${num}`)
+    }
 
     navigate(`/camera/${liftId}/${angle}/${num}`)
   }

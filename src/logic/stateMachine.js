@@ -1,6 +1,7 @@
 import { computeAngles, checkDepth, pickBestSide,
          lateralityScore, classifyCamera,
-         handFootDistance } from './poseUtils.js'
+         handFootDistance, euclideanDistance,
+         benchPickBestSide, computeElbowAngle } from './poseUtils.js'
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
 export const SquatState = {
@@ -609,6 +610,255 @@ export class DeadliftReferee {
       side,
       camera,
       angles,
+    }
+  }
+}
+
+
+// ── Bench Press States ────────────────────────────────────────────────────────
+export const BenchState = {
+  WAITING:    'WAITING',
+  SETUP:      'SETUP',
+  LOCKOUT:    'LOCKOUT',
+  DESCENDING: 'DESCENDING',
+  CHEST:      'CHEST',
+  PRESSING:   'PRESSING',
+  COMPLETE:   'COMPLETE',
+}
+
+export const BENCH_STATE_MESSAGES = {
+  [BenchState.WAITING]:    'READY — Lie in frame',
+  [BenchState.SETUP]:      'DETECTED — Hold still',
+  [BenchState.LOCKOUT]:    'HOLD — Arms locked out',
+  [BenchState.DESCENDING]: 'DESCENDING ▼',
+  [BenchState.CHEST]:      'CHEST — Hold still',
+  [BenchState.PRESSING]:   'PRESS ▲',
+  [BenchState.COMPLETE]:   'SET COMPLETE',
+}
+
+export class BenchReferee {
+  constructor(onCommand, totalReps = 1, angle = 'side', calibration = null) {
+    this.ELBOW_LOCK_ANGLE      = 160
+    this.CHEST_RATIO_TOLERANCE = 0.06
+    this.VELOCITY_THRESHOLD    = 0.004
+    this.LOCKOUT_HOLD_FRAMES   = 20
+    this.CHEST_HOLD_FRAMES     = 15
+    this.SETUP_HOLD_FRAMES     = 25
+
+    this.onCommand   = onCommand
+    this.totalReps   = totalReps
+    this.angle       = angle.toLowerCase()
+    this.calibration = calibration
+
+    this._reset()
+  }
+
+  _reset() {
+    this.state      = BenchState.WAITING
+    this.result     = LiftResult.PENDING
+    this.currentRep = 0
+    this.repResults = []
+    this._faults    = []
+    this._resetForNextRep()
+  }
+
+  reset() {
+    this._reset()
+  }
+
+  _resetForNextRep() {
+    this._faults            = []
+    this._lockoutFrames     = 0
+    this._chestFrames       = 0
+    this._commandFired      = false
+    this._elbowAngleHistory = []
+    this._wristHistory      = []
+    this._descendStarted    = false
+    this._chestReached      = false
+  }
+
+  _addFault(fault) {
+    if (!this._faults.includes(fault)) this._faults.push(fault)
+  }
+
+  _giveCommand(command) {
+    this.onCommand(command)
+    console.log(`>>> ${command.toUpperCase()} <<<`)
+  }
+
+  _completeRep() {
+    const repResult = this._chestReached && this._faults.length === 0
+      ? LiftResult.WHITE : LiftResult.RED
+    const reasons = this._chestReached
+      ? [...this._faults]
+      : ['Bar did not reach chest', ...this._faults]
+    this.repResults.push({
+      rep:    this.currentRep,
+      result: repResult,
+      faults: repResult === LiftResult.RED ? reasons : [],
+    })
+  }
+
+  _updateWristHistory(landmarks, side) {
+    const wrist = landmarks[`${side}_wrist`]
+    if (!wrist) return Infinity
+    this._wristHistory.push({ x: wrist.x, y: wrist.y })
+    if (this._wristHistory.length > 5) this._wristHistory.shift()
+    if (this._wristHistory.length < 2) return Infinity
+    const prev = this._wristHistory[this._wristHistory.length - 2]
+    const curr = this._wristHistory[this._wristHistory.length - 1]
+    return Math.sqrt((curr.x - prev.x) ** 2 + (curr.y - prev.y) ** 2)
+  }
+
+  _updateElbowHistory(elbowAngle) {
+    this._elbowAngleHistory.push(elbowAngle)
+    if (this._elbowAngleHistory.length > 8) this._elbowAngleHistory.shift()
+  }
+
+  _elbowAtLocalMinimum() {
+    const h = this._elbowAngleHistory
+    if (h.length < 4) return false
+    const minPrev = Math.min(...h.slice(0, -1))
+    return h[h.length - 1] > minPrev + 3
+  }
+
+  _isAtChest(landmarks, side, elbowAngle, wristVelocity) {
+    const wristStill = wristVelocity < this.VELOCITY_THRESHOLD
+    if (this.calibration) {
+      const calSide  = this.calibration.side
+      const shoulder = landmarks[`${calSide}_shoulder`]
+      const wrist    = landmarks[`${calSide}_wrist`]
+      if (shoulder && wrist) {
+        const currentRatio = euclideanDistance(shoulder, wrist) / this.calibration.armExtendedDistance
+        return currentRatio <= this.calibration.chestRatio + this.CHEST_RATIO_TOLERANCE
+          && wristStill && this._elbowAtLocalMinimum()
+      }
+    }
+    return elbowAngle < 100 && wristStill && this._elbowAtLocalMinimum()
+  }
+
+  update(landmarks, barY = null) {
+    const side = benchPickBestSide(landmarks)
+    if (!side) return this._emptyReturn()
+
+    const elbowAngle    = computeElbowAngle(landmarks, side)
+    if (elbowAngle === null) return this._emptyReturn()
+
+    const wristVelocity = this._updateWristHistory(landmarks, side)
+    const wristStill    = wristVelocity < this.VELOCITY_THRESHOLD
+    const lockedOut     = elbowAngle >= this.ELBOW_LOCK_ANGLE
+
+    this._updateElbowHistory(elbowAngle)
+    const atChest = this._isAtChest(landmarks, side, elbowAngle, wristVelocity)
+
+    if (this.state === BenchState.WAITING) {
+      if (lockedOut) { this.state = BenchState.SETUP; this._lockoutFrames = 0 }
+
+    } else if (this.state === BenchState.SETUP) {
+      if (!lockedOut) {
+        this.state = BenchState.WAITING
+      } else if (wristStill) {
+        this._lockoutFrames++
+        if (this._lockoutFrames >= this.SETUP_HOLD_FRAMES) this.state = BenchState.LOCKOUT
+      } else {
+        this._lockoutFrames = Math.max(0, this._lockoutFrames - 1)
+      }
+
+    } else if (this.state === BenchState.LOCKOUT) {
+      if (!lockedOut) {
+        this.currentRep++
+        this._giveCommand('start')
+        this._elbowAngleHistory = []
+        this._wristHistory      = []
+        this._descendStarted    = true
+        this.state              = BenchState.DESCENDING
+      }
+
+    } else if (this.state === BenchState.DESCENDING) {
+      if (atChest) {
+        this._chestReached = true
+        this._chestFrames  = 0
+        this.state         = BenchState.CHEST
+      }
+
+    } else if (this.state === BenchState.CHEST) {
+      if (!atChest && !wristStill) {
+        this.state = BenchState.PRESSING
+      } else if (wristStill) {
+        this._chestFrames++
+        if (this._chestFrames >= this.CHEST_HOLD_FRAMES) {
+          this._giveCommand('press')
+        }
+      }
+
+    } else if (this.state === BenchState.PRESSING) {
+      if (atChest) { this.state = BenchState.CHEST; return this._buildReturn(side, elbowAngle, wristVelocity, atChest) }
+      if (lockedOut) {
+        this.state          = BenchState.LOCKOUT
+        this._lockoutFrames = 0
+        this._commandFired  = false
+        this._descendStarted = false
+      }
+    }
+
+    if (this.state === BenchState.LOCKOUT && this._descendStarted) {
+      if (wristStill) {
+        this._lockoutFrames++
+        if (this._lockoutFrames >= this.LOCKOUT_HOLD_FRAMES && !this._commandFired) {
+          this._commandFired = true
+          this._completeRep()
+          if (this.currentRep >= this.totalReps) {
+            this._giveCommand('rack')
+            this.result = LiftResult.WHITE
+            this.state  = BenchState.COMPLETE
+          } else {
+            this._giveCommand('start')
+            this._resetForNextRep()
+            this.currentRep++
+            this._elbowAngleHistory = []
+            this._wristHistory      = []
+            this.state              = BenchState.DESCENDING
+          }
+        }
+      } else {
+        this._lockoutFrames = Math.max(0, this._lockoutFrames - 1)
+      }
+    }
+
+    return this._buildReturn(side, elbowAngle, wristVelocity, atChest)
+  }
+
+  _buildReturn(side, elbowAngle, wristVelocity, atChest) {
+    const wristStill = wristVelocity < this.VELOCITY_THRESHOLD
+    const lockedOut  = elbowAngle >= this.ELBOW_LOCK_ANGLE
+    const progress   = this.state === BenchState.SETUP
+      ? this._lockoutFrames / this.SETUP_HOLD_FRAMES
+      : this.state === BenchState.CHEST
+        ? this._chestFrames / this.CHEST_HOLD_FRAMES
+        : 0
+    return {
+      state:      this.state,
+      result:     this.result,
+      progress,
+      checks: [
+        { label: 'Arms locked',  passed: lockedOut               },
+        { label: 'Wrist still',  passed: wristStill              },
+        { label: 'Bar at chest', passed: atChest                 },
+        { label: 'Calibrated',   passed: this.calibration !== null },
+      ],
+      currentRep: this.currentRep,
+      totalReps:  this.totalReps,
+      repResults: this.repResults,
+      side,
+      elbowAngle,
+    }
+  }
+
+  _emptyReturn() {
+    return {
+      state: this.state, result: this.result, progress: 0,
+      checks: [], currentRep: this.currentRep,
+      totalReps: this.totalReps, repResults: this.repResults, side: null,
     }
   }
 }

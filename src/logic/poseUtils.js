@@ -146,3 +146,34 @@ export function handFootDistance(landmarks) {
   const rightDist = Math.abs(landmarks.right_wrist.y - landmarks.right_ankle.y)
   return (leftDist + rightDist) / 2
 }
+
+
+// ── Bench press additions ─────────────────────────────────────────────────────
+
+export function euclideanDistance(a, b) {
+  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+}
+
+export function benchPickBestSide(landmarks, minVisibility = 0.5) {
+  const leftScore = Math.min(
+    landmarks.left_shoulder?.visibility  ?? 0,
+    landmarks.left_elbow?.visibility     ?? 0,
+    landmarks.left_wrist?.visibility     ?? 0,
+  )
+  const rightScore = Math.min(
+    landmarks.right_shoulder?.visibility ?? 0,
+    landmarks.right_elbow?.visibility    ?? 0,
+    landmarks.right_wrist?.visibility    ?? 0,
+  )
+  const best      = leftScore >= rightScore ? 'left' : 'right'
+  const bestScore = best === 'left' ? leftScore : rightScore
+  return bestScore > minVisibility ? best : null
+}
+
+export function computeElbowAngle(landmarks, side) {
+  const shoulder = landmarks[`${side}_shoulder`]
+  const elbow    = landmarks[`${side}_elbow`]
+  const wrist    = landmarks[`${side}_wrist`]
+  if (!shoulder || !elbow || !wrist) return null
+  return angleBetween(shoulder, elbow, wrist)
+}

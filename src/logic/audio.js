@@ -24,7 +24,7 @@ export async function initAudio() {
       log(`AudioContext resumed, state: ${audioContext.state}`)
     }
 
-    const files = ['squat', 'rack', 'down']
+    const files = ['squat', 'rack', 'down', 'start', 'press']
     await Promise.all(files.map(async (name) => {
       try {
         log(`fetching ${name}...`)
