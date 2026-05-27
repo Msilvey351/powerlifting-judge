@@ -281,11 +281,11 @@ export default function CalibrationScreen() {
 
   // ── Navigation ────────────────────────────────────────────────────────────
   const goToCamera = () => {
-    navigate(`/camera/${liftId}/${angle}/${reps}`)
-  }
+    navigate(`/angle/${liftId}`)
+  } 
 
   const skipCalibration = () => {
-    navigate(`/camera/${liftId}/${angle}/${reps}`)
+    navigate(`/angle/${liftId}`)
   }
 
   // ── DONE screen ───────────────────────────────────────────────────────────
