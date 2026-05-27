@@ -1,13 +1,18 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useNavigate, useParams }                   from 'react-router-dom'
 import { PoseLandmarker, FilesetResolver, DrawingUtils } from '@mediapipe/tasks-vision'
 import { initAudio, speakCommand }   from '../logic/audio'
 import { extractLandmarks }          from '../logic/poseUtils'
 import { BarDetector }               from '../logic/barDetector'
-import { getBenchCalibration }       from '../logic/calibrationStore'
+import { getCalibration }            from '../logic/calibrationStore'
 import {
-  SquatReferee, DeadliftReferee, BenchReferee,
-  LiftResult, STATE_MESSAGES, DEADLIFT_STATE_MESSAGES, BENCH_STATE_MESSAGES,
+  SquatReferee,
+  DeadliftReferee,
+  BenchReferee,
+  LiftResult,
+  STATE_MESSAGES,
+  DEADLIFT_STATE_MESSAGES,
+  BENCH_STATE_MESSAGES,
 } from '../logic/stateMachine'
 import StatusBar      from '../widgets/StatusBar'
 import ResultsOverlay from '../widgets/ResultsOverlay'
@@ -15,8 +20,6 @@ import ResultsOverlay from '../widgets/ResultsOverlay'
 function CameraScreen() {
   const navigate                = useNavigate()
   const { liftId, angle, reps } = useParams()
-  const [searchParams]          = useSearchParams()
-  const lifterName              = searchParams.get('lifter') ?? null
 
   const videoRef          = useRef(null)
   const canvasRef         = useRef(null)
@@ -40,8 +43,11 @@ function CameraScreen() {
 
   const formatParam = (str) => str.charAt(0).toUpperCase() + str.slice(1)
 
-  const handleCommand = useCallback((command) => { speakCommand(command) }, [])
+  const handleCommand = useCallback((command) => {
+    speakCommand(command)
+  }, [])
 
+  // ── Detection loop ──────────────────────────────────────────────────────────
   const startDetectionLoop = useCallback(() => {
     const video          = videoRef.current
     const canvas         = canvasRef.current
@@ -63,25 +69,34 @@ function CameraScreen() {
         if (results.landmarks && results.landmarks.length > 0) {
           const rawLandmarks = results.landmarks[0]
 
-          drawingUtils.drawConnectors(rawLandmarks, PoseLandmarker.POSE_CONNECTIONS,
-            { color: '#00FF00', lineWidth: 2 })
-          drawingUtils.drawLandmarks(rawLandmarks,
-            { color: '#FF0000', lineWidth: 1, radius: 3 })
+          drawingUtils.drawConnectors(
+            rawLandmarks,
+            PoseLandmarker.POSE_CONNECTIONS,
+            { color: '#00FF00', lineWidth: 2 }
+          )
+          drawingUtils.drawLandmarks(
+            rawLandmarks,
+            { color: '#FF0000', lineWidth: 1, radius: 3 }
+          )
 
           const landmarks = extractLandmarks(rawLandmarks)
 
+          // Bar detection for bench
           let barY = null
           if (isBench && barDetectorRef.current) {
             const wristY = landmarks.left_wrist?.y ?? landmarks.right_wrist?.y ?? null
             barY = barDetectorRef.current.processFrame(video, wristY)
           }
 
+          // State machine update
           const update = isBench
             ? referee.update(landmarks, barY)
             : referee.update(landmarks)
 
           if (update.currentRep > 0) {
-            setStatus(`Rep ${update.currentRep}/${totalReps} — ${stateMessages[update.state] ?? update.state}`)
+            setStatus(
+              `Rep ${update.currentRep}/${totalReps} — ${stateMessages[update.state] ?? update.state}`
+            )
           } else {
             setStatus(stateMessages[update.state] ?? update.state)
           }
@@ -109,11 +124,12 @@ function CameraScreen() {
     detect()
   }, [totalReps, stateMessages, isBench])
 
+  // ── Start camera ────────────────────────────────────────────────────────────
   const startCamera = useCallback(async () => {
     const attempts = [
       { video: { facingMode: 'user' } },
       { video: { facingMode: 'environment' } },
-      { video: true }
+      { video: true },
     ]
     let lastError = null
     for (const constraints of attempts) {
@@ -129,17 +145,21 @@ function CameraScreen() {
           }
         }
         return
-      } catch (err) { lastError = err }
+      } catch (err) {
+        lastError = err
+      }
     }
     setCameraError(lastError.name + ': ' + lastError.message)
   }, [startDetectionLoop])
 
+  // ── Load everything ─────────────────────────────────────────────────────────
   useEffect(() => {
     const setup = async () => {
       await initAudio()
 
+      // Build correct referee
       if (isBench) {
-        const calibration      = lifterName ? getBenchCalibration(lifterName) : null
+        const calibration      = getCalibration('bench', angle.toLowerCase())
         refereeRef.current     = new BenchReferee(handleCommand, totalReps, angle, calibration)
         barDetectorRef.current = new BarDetector()
       } else if (isDeadlift) {
@@ -175,9 +195,11 @@ function CameraScreen() {
       if (poseLandmarkerRef.current)  poseLandmarkerRef.current.close()
       if (barDetectorRef.current)     barDetectorRef.current.dispose()
     }
-  }, [handleCommand, startCamera, totalReps, isBench, isDeadlift, angle, lifterName])
+  }, [handleCommand, startCamera, totalReps, isBench, isDeadlift, angle])
 
-  const handleBack    = () => navigate('/')
+  // ── Handlers ────────────────────────────────────────────────────────────────
+  const handleBack = () => navigate('/')
+
   const handleDismiss = () => {
     setResult(LiftResult.PENDING)
     setRepResults([])
@@ -186,15 +208,16 @@ function CameraScreen() {
     navigate('/')
   }
 
+  // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div style={styles.container}>
       <div style={styles.topBar}>
         <button onClick={handleBack} style={styles.backButton}>← Back</button>
         <span style={styles.liftInfo}>
           {formatParam(liftId)} | {formatParam(angle)} | {totalReps} {totalReps === 1 ? 'rep' : 'reps'}
-          {lifterName ? ` | ${lifterName}` : ''}
         </span>
       </div>
+
       <div style={styles.cameraArea}>
         {cameraError ? (
           <p style={styles.errorText}>Error: {cameraError}</p>
@@ -203,11 +226,16 @@ function CameraScreen() {
             <video ref={videoRef} autoPlay playsInline muted style={styles.video} />
             <canvas ref={canvasRef} style={styles.canvas} />
             {result !== LiftResult.PENDING && (
-              <ResultsOverlay repResults={repResults} totalReps={totalReps} onDismiss={handleDismiss} />
+              <ResultsOverlay
+                repResults={repResults}
+                totalReps={totalReps}
+                onDismiss={handleDismiss}
+              />
             )}
           </>
         )}
       </div>
+
       <StatusBar status={status} />
     </div>
   )

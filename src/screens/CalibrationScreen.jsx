@@ -4,43 +4,64 @@ import { useNavigate, useParams }                   from 'react-router-dom'
 import { PoseLandmarker, FilesetResolver, DrawingUtils } from '@mediapipe/tasks-vision'
 import { extractLandmarks, euclideanDistance,
          benchPickBestSide, computeElbowAngle }     from '../logic/poseUtils'
-import { saveBenchCalibration, listProfiles,
-         getBenchCalibration }                      from '../logic/calibrationStore'
+import { saveCalibration, getCalibration }          from '../logic/calibrationStore'
 
-const CalStep = {
-  NAME:    'NAME',
-  LOCKOUT: 'LOCKOUT',
-  CHEST:   'CHEST',
-  DONE:    'DONE',
+// ── Constants ─────────────────────────────────────────────────────────────────
+const TOTAL_REPS        = 3
+const HOLD_FRAMES       = 20    // frames still needed to confirm lockout or chest
+const VELOCITY_THRESH   = 0.005
+const ELBOW_LOCK_ANGLE  = 155
+const ELBOW_CHEST_ANGLE = 110   // below this = bar is approaching chest
+
+// ── Calibration state machine states ─────────────────────────────────────────
+const CalState = {
+  LOADING:    'LOADING',     // mediapipe not ready yet
+  WAITING:    'WAITING',     // waiting for lifter to get into position
+  LOCKOUT:    'LOCKOUT',     // holding at lockout
+  DESCENDING: 'DESCENDING',  // bar going down
+  CHEST:      'CHEST',       // holding at chest
+  ASCENDING:  'ASCENDING',   // bar going up
+  DONE:       'DONE',        // all 3 reps recorded
 }
-
-const HOLD_FRAMES_REQUIRED = 30
-const VELOCITY_THRESHOLD   = 0.004
-const ELBOW_LOCK_ANGLE     = 155
 
 export default function CalibrationScreen() {
   const navigate                = useNavigate()
   const { liftId, angle, reps } = useParams()
+  const view                    = angle.toLowerCase()
 
+  // ── MediaPipe refs ────────────────────────────────────────────────────────
   const videoRef          = useRef(null)
   const canvasRef         = useRef(null)
   const poseLandmarkerRef = useRef(null)
   const animFrameRef      = useRef(null)
-  const armExtendedRef    = useRef(null)
-  const calSideRef        = useRef(null)
+
+  // ── Calibration data refs (mutated each frame, not React state) ───────────
+  const calStateRef       = useRef(CalState.LOADING)
   const holdFramesRef     = useRef(0)
   const wristHistoryRef   = useRef([])
+  const lockoutSamplesRef = useRef([])   // armExtended per rep
+  const chestSamplesRef   = useRef([])   // armBent per rep
+  const repCountRef       = useRef(0)
+  const calSideRef        = useRef(null)
 
-  const [step,             setStep]             = useState(CalStep.NAME)
-  const [lifterName,       setLifterName]       = useState('')
-  const [nameInput,        setNameInput]        = useState('')
-  const [existingProfiles, setExistingProfiles] = useState([])
-  const [progress,         setProgress]         = useState(0)
-  const [instruction,      setInstruction]      = useState('')
-  const [cameraError,      setCameraError]      = useState(null)
+  // ── React state (UI only) ─────────────────────────────────────────────────
+  const [uiState,      setUiState]      = useState(CalState.LOADING)
+  const [instruction,  setInstruction]  = useState('Loading camera...')
+  const [repCount,     setRepCount]     = useState(0)
+  const [progress,     setProgress]     = useState(0)
+  const [cameraError,  setCameraError]  = useState(null)
+  const [existingCal,  setExistingCal]  = useState(null)
+  const [savedRatio,   setSavedRatio]   = useState(null)
 
-  useEffect(() => { setExistingProfiles(listProfiles()) }, [])
+  // Check for existing calibration on mount
+  useEffect(() => {
+    const cal = getCalibration(liftId, view)
+    if (cal) {
+      setExistingCal(cal)
+    }
+  }, [liftId, view])
 
+  // ── Wrist velocity ────────────────────────────────────────────────────────
   const getWristVelocity = useCallback((landmarks, side) => {
     const wrist = landmarks[`${side}_wrist`]
     if (!wrist) return Infinity
@@ -53,12 +74,7 @@ export default function CalibrationScreen() {
     return Math.sqrt((curr.x - prev.x) ** 2 + (curr.y - prev.y) ** 2)
   }, [])
 
-  const stepRef = useRef(step)
-  useEffect(() => { stepRef.current = step }, [step])
-
-  const lifterNameRef = useRef(lifterName)
-  useEffect(() => { lifterNameRef.current = lifterName }, [lifterName])
-
+  // ── Main detection loop ───────────────────────────────────────────────────
   const runLoop = useCallback(() => {
     const video  = videoRef.current
     const canvas = canvasRef.current
@@ -77,90 +93,137 @@ export default function CalibrationScreen() {
         const results = lm.detectForVideo(video, performance.now())
 
         if (results.landmarks?.length > 0) {
-          const raw       = results.landmarks[0]
-          draw.drawConnectors(raw, PoseLandmarker.POSE_CONNECTIONS, { color: '#00FF00', lineWidth: 2 })
-          draw.drawLandmarks(raw, { color: '#FF0000', lineWidth: 1, radius: 3 })
+          const raw = results.landmarks[0]
+          draw.drawConnectors(raw, PoseLandmarker.POSE_CONNECTIONS,
+            { color: '#00FF00', lineWidth: 2 })
+          draw.drawLandmarks(raw,
+            { color: '#FF0000', lineWidth: 1, radius: 3 })
 
           const landmarks = extractLandmarks(raw)
           const side      = benchPickBestSide(landmarks)
 
           if (!side) {
-            holdFramesRef.current = 0
-            setProgress(0)
             setInstruction('Hold arms in frame')
             animFrameRef.current = requestAnimationFrame(loop)
             return
           }
 
-          const elbowAngle = computeElbowAngle(landmarks, side)
-          const velocity   = getWristVelocity(landmarks, side)
-          const wristStill = velocity < VELOCITY_THRESHOLD
-          const lockedOut  = elbowAngle >= ELBOW_LOCK_ANGLE
-          const currentStep = stepRef.current
+          // Lock side for consistency across all reps
+          if (!calSideRef.current) calSideRef.current = side
 
-          if (currentStep === CalStep.LOCKOUT) {
-            if (lockedOut && wristStill) {
-              holdFramesRef.current++
-            } else {
-              holdFramesRef.current = Math.max(0, holdFramesRef.current - 2)
-            }
-            const prog = Math.min(holdFramesRef.current / HOLD_FRAMES_REQUIRED, 1)
-            setProgress(prog)
-            setInstruction(
-              lockedOut
-                ? wristStill
-                  ? `Hold still… ${Math.round(prog * 100)}%`
-                  : 'Keep arms locked — hold still'
-                : 'Lock out your arms fully'
-            )
-            if (holdFramesRef.current >= HOLD_FRAMES_REQUIRED) {
-              armExtendedRef.current = euclideanDistance(
-                landmarks[`${side}_shoulder`],
-                landmarks[`${side}_wrist`]
-              )
-              calSideRef.current     = side
-              holdFramesRef.current  = 0
-              wristHistoryRef.current = []
-              setProgress(0)
-              setStep(CalStep.CHEST)
+          const elbowAngle    = computeElbowAngle(landmarks, calSideRef.current)
+          const velocity      = getWristVelocity(landmarks, calSideRef.current)
+          const wristStill    = velocity < VELOCITY_THRESH
+          const lockedOut     = elbowAngle >= ELBOW_LOCK_ANGLE
+          const nearChest     = elbowAngle < ELBOW_CHEST_ANGLE
+          const currentState  = calStateRef.current
+
+          const shoulder = landmarks[`${calSideRef.current}_shoulder`]
+          const wrist    = landmarks[`${calSideRef.current}_wrist`]
+          const armDist  = euclideanDistance(shoulder, wrist)
+
+          // ── State transitions ─────────────────────────────────────────────
+
+          if (currentState === CalState.WAITING) {
+            setInstruction('Lock out your arms to begin')
+            if (lockedOut) {
+              calStateRef.current = CalState.LOCKOUT
+              holdFramesRef.current = 0
             }
 
-          } else if (currentStep === CalStep.CHEST) {
-            const elbowBent = elbowAngle < 110
-            if (elbowBent && wristStill) {
+          } else if (currentState === CalState.LOCKOUT) {
+            if (!lockedOut) {
+              holdFramesRef.current = 0
+              setInstruction('Hold arms fully locked out')
+            } else if (wristStill) {
               holdFramesRef.current++
+              const prog = Math.min(holdFramesRef.current / HOLD_FRAMES, 1)
+              setProgress(prog)
+              setInstruction(`Hold… ${Math.round(prog * 100)}%`)
+
+              if (holdFramesRef.current >= HOLD_FRAMES) {
+                // Record lockout distance for this rep
+                lockoutSamplesRef.current.push(armDist)
+                holdFramesRef.current  = 0
+                wristHistoryRef.current = []
+                calStateRef.current    = CalState.DESCENDING
+                setProgress(0)
+                setInstruction('Lower bar to chest')
+              }
             } else {
-              holdFramesRef.current = Math.max(0, holdFramesRef.current - 2)
+              holdFramesRef.current = Math.max(0, holdFramesRef.current - 1)
             }
-            const prog = Math.min(holdFramesRef.current / HOLD_FRAMES_REQUIRED, 1)
-            setProgress(prog)
-            setInstruction(
-              elbowBent
-                ? wristStill
-                  ? `Hold still… ${Math.round(prog * 100)}%`
-                  : 'Hold the bar on your chest — keep still'
-                : 'Lower bar to chest and hold'
-            )
-            if (holdFramesRef.current >= HOLD_FRAMES_REQUIRED) {
-              const calSide        = calSideRef.current
-              const armBentDist    = euclideanDistance(
-                landmarks[`${calSide}_shoulder`],
-                landmarks[`${calSide}_wrist`]
-              )
-              const chestRatio     = armBentDist / armExtendedRef.current
-              saveBenchCalibration(lifterNameRef.current, {
-                chestRatio,
-                armExtendedDistance: armExtendedRef.current,
-                side: calSideRef.current,
-              })
-              setStep(CalStep.DONE)
+
+          } else if (currentState === CalState.DESCENDING) {
+            setInstruction('Lower bar to chest')
+            if (nearChest && wristStill) {
+              calStateRef.current   = CalState.CHEST
+              holdFramesRef.current = 0
+            }
+
+          } else if (currentState === CalState.CHEST) {
+            if (!nearChest) {
+              // bar moved back up before we confirmed — go back
+              calStateRef.current   = CalState.DESCENDING
+              holdFramesRef.current = 0
+            } else if (wristStill) {
+              holdFramesRef.current++
+              const prog = Math.min(holdFramesRef.current / HOLD_FRAMES, 1)
+              setProgress(prog)
+              setInstruction(`Hold at chest… ${Math.round(prog * 100)}%`)
+
+              if (holdFramesRef.current >= HOLD_FRAMES) {
+                // Record chest distance for this rep
+                chestSamplesRef.current.push(armDist)
+                holdFramesRef.current  = 0
+                wristHistoryRef.current = []
+                calStateRef.current    = CalState.ASCENDING
+                setProgress(0)
+                setInstruction('Press back up to lockout')
+              }
+            } else {
+              holdFramesRef.current = Math.max(0, holdFramesRef.current - 1)
+            }
+
+          } else if (currentState === CalState.ASCENDING) {
+            setInstruction('Press back up to lockout')
+            if (lockedOut) {
+              const newRepCount = repCountRef.current + 1
+              repCountRef.current = newRepCount
+              setRepCount(newRepCount)
+
+              if (newRepCount >= TOTAL_REPS) {
+                // All reps done — compute averages and save
+                const avgExtended = lockoutSamplesRef.current.reduce((a, b) => a + b, 0)
+                                    / lockoutSamplesRef.current.length
+                const avgBent     = chestSamplesRef.current.reduce((a, b) => a + b, 0)
+                                    / chestSamplesRef.current.length
+                const chestRatio  = avgBent / avgExtended
+
+                saveCalibration(liftId, view, {
+                  chestRatio,
+                  armExtendedDistance: avgExtended,
+                })
+
+                setSavedRatio(chestRatio)
+                calStateRef.current = CalState.DONE
+                setUiState(CalState.DONE)
+
+                console.log(`[Cal] Done. ratio=${chestRatio.toFixed(3)}, extended=${avgExtended.toFixed(3)}`)
+              } else {
+                // More reps needed
+                calStateRef.current   = CalState.LOCKOUT
+                holdFramesRef.current = 0
+                wristHistoryRef.current = []
+              }
             }
           }
 
+          // Sync UI state for instruction panel
+          setUiState(calStateRef.current)
+
         } else {
           setInstruction('Get into position')
-          holdFramesRef.current = 0
-          setProgress(0)
         }
       }
 
@@ -168,10 +231,10 @@ export default function CalibrationScreen() {
     }
 
     loop()
-  }, [getWristVelocity])
+  }, [getWristVelocity, liftId, view])
 
+  // ── Load MediaPipe + camera ───────────────────────────────────────────────
   useEffect(() => {
-    if (step !== CalStep.LOCKOUT) return
     let cancelled = false
 
     const start = async () => {
@@ -187,12 +250,19 @@ export default function CalibrationScreen() {
           runningMode: 'VIDEO',
           numPoses: 1,
         })
+
         if (cancelled) return
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } })
-        const video  = videoRef.current
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user' }
+        })
+        const video = videoRef.current
         if (video && !cancelled) {
           video.srcObject = stream
           await video.play()
+          calStateRef.current = CalState.WAITING
+          setUiState(CalState.WAITING)
+          setInstruction('Lock out your arms to begin')
           runLoop()
         }
       } catch (err) {
@@ -201,86 +271,63 @@ export default function CalibrationScreen() {
     }
 
     start()
+
     return () => {
       cancelled = true
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current)
       if (poseLandmarkerRef.current) poseLandmarkerRef.current.close()
     }
-  }, [step, runLoop])
+  }, [runLoop])
 
+  // ── Navigation ────────────────────────────────────────────────────────────
   const goToCamera = () => {
-    navigate(`/camera/${liftId}/${angle}/${reps}?lifter=${encodeURIComponent(lifterName)}`)
+    navigate(`/camera/${liftId}/${angle}/${reps}`)
   }
 
   const skipCalibration = () => {
     navigate(`/camera/${liftId}/${angle}/${reps}`)
   }
 
-  const confirmName = (name) => {
-    const trimmed = name.trim()
-    if (!trimmed) return
-    setLifterName(trimmed)
-    setStep(CalStep.LOCKOUT)
-    setInstruction('Lock out your arms fully')
-  }
-
-  // ── NAME step ───────────────────────────────────────────────────────────────
-  if (step === CalStep.NAME) {
+  // ── DONE screen ───────────────────────────────────────────────────────────
+  if (uiState === CalState.DONE) {
     return (
       <div style={styles.container}>
         <div style={styles.panel}>
-          <h2 style={styles.heading}>Bench Press Calibration</h2>
+          <h2 style={styles.heading}>✓ Calibrated</h2>
           <p style={styles.sub}>
-            Records your arm position at lockout and chest contact. Takes about 10 seconds.
+            {TOTAL_REPS}-rep average saved for{' '}
+            <strong>Bench Press — {angle} view</strong>.
           </p>
-
-          {existingProfiles.length > 0 && (
-            <div style={styles.section}>
-              <p style={styles.label}>Existing lifters:</p>
-              {existingProfiles.map(name => (
-                <button key={name} style={styles.profileBtn} onClick={() => confirmName(name)}>
-                  {name}
-                </button>
-              ))}
-            </div>
+          {savedRatio && (
+            <p style={styles.ratioText}>
+              Chest ratio: {(savedRatio * 100).toFixed(1)}%
+            </p>
           )}
-
-          <div style={styles.section}>
-            <p style={styles.label}>New lifter:</p>
-            <input
-              style={styles.input}
-              placeholder="Enter name"
-              value={nameInput}
-              onChange={e => setNameInput(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && confirmName(nameInput)}
-            />
-            <button style={styles.primaryBtn} onClick={() => confirmName(nameInput)}>
-              Start Calibration
-            </button>
-          </div>
-
-          <button style={styles.skipBtn} onClick={skipCalibration}>
-            Skip — use elbow angle only
+          <button style={styles.primaryBtn} onClick={goToCamera}>
+            Start Lifting
+          </button>
+          <button style={styles.skipBtn} onClick={() => {
+            // Redo calibration
+            repCountRef.current       = 0
+            lockoutSamplesRef.current = []
+            chestSamplesRef.current   = []
+            calSideRef.current        = null
+            holdFramesRef.current     = 0
+            wristHistoryRef.current   = []
+            calStateRef.current       = CalState.WAITING
+            setRepCount(0)
+            setProgress(0)
+            setUiState(CalState.WAITING)
+            setSavedRatio(null)
+          }}>
+            Redo calibration
           </button>
         </div>
       </div>
     )
   }
 
-  // ── DONE step ───────────────────────────────────────────────────────────────
-  if (step === CalStep.DONE) {
-    return (
-      <div style={styles.container}>
-        <div style={styles.panel}>
-          <h2 style={styles.heading}>✓ Calibrated</h2>
-          <p style={styles.sub}>Chest position saved for <strong>{lifterName}</strong>.</p>
-          <button style={styles.primaryBtn} onClick={goToCamera}>Start Lifting</button>
-        </div>
-      </div>
-    )
-  }
-
-  // ── LOCKOUT / CHEST steps ───────────────────────────────────────────────────
+  // ── Camera + instruction screen ───────────────────────────────────────────
   return (
     <div style={styles.container}>
       <div style={styles.cameraArea}>
@@ -293,16 +340,50 @@ export default function CalibrationScreen() {
           </>
         )}
       </div>
+
       <div style={styles.infoPanel}>
-        <p style={styles.stepLabel}>
-          {step === CalStep.LOCKOUT ? 'Step 1 of 2 — Lockout' : 'Step 2 of 2 — Chest'}
-        </p>
-        <p style={styles.instructionText}>{instruction}</p>
-        <div style={styles.progressTrack}>
-          <div style={{ ...styles.progressFill, width: `${progress * 100}%` }} />
+        {/* Header */}
+        <div style={styles.headerRow}>
+          <div>
+            <p style={styles.stepLabel}>
+              Bench Press — {angle} View Calibration
+            </p>
+            <p style={styles.repCounter}>
+              Rep {Math.min(repCount + 1, TOTAL_REPS)} of {TOTAL_REPS}
+            </p>
+          </div>
+          {existingCal && (
+            <p style={styles.existingLabel}>
+              Existing cal: {(existingCal.chestRatio * 100).toFixed(1)}%
+            </p>
+          )}
         </div>
+
+        {/* Instruction */}
+        <p style={styles.instructionText}>{instruction}</p>
+
+        {/* Progress bar — shows during holds */}
+        {progress > 0 && (
+          <div style={styles.progressTrack}>
+            <div style={{ ...styles.progressFill, width: `${progress * 100}%` }} />
+          </div>
+        )}
+
+        {/* Rep dots */}
+        <div style={styles.repDots}>
+          {Array.from({ length: TOTAL_REPS }).map((_, i) => (
+            <div
+              key={i}
+              style={{
+                ...styles.dot,
+                background: i < repCount ? '#4CAF50' : '#333',
+              }}
+            />
+          ))}
+        </div>
+
         <button style={styles.skipBtn} onClick={skipCalibration}>
-          Skip calibration
+          Skip — use elbow angle only
         </button>
       </div>
     </div>
@@ -310,23 +391,25 @@ export default function CalibrationScreen() {
 }
 
 const styles = {
-  container:       { display: 'flex', flexDirection: 'column', height: '100vh', background: '#000', color: '#fff', alignItems: 'center', justifyContent: 'center' },
-  panel:           { padding: '32px 24px', maxWidth: '400px', width: '100%' },
-  heading:         { fontSize: '24px', fontWeight: '700', marginBottom: '8px' },
-  sub:             { fontSize: '14px', color: '#aaa', marginBottom: '24px', lineHeight: '1.5' },
-  section:         { marginBottom: '24px' },
-  label:           { fontSize: '13px', color: '#888', marginBottom: '8px' },
-  profileBtn:      { display: 'block', width: '100%', padding: '12px', marginBottom: '8px', background: '#222', color: '#fff', border: '1px solid #444', borderRadius: '8px', fontSize: '16px', cursor: 'pointer', textAlign: 'left' },
-  input:           { display: 'block', width: '100%', padding: '12px', marginBottom: '12px', background: '#111', color: '#fff', border: '1px solid #444', borderRadius: '8px', fontSize: '16px', boxSizing: 'border-box' },
-  primaryBtn:      { display: 'block', width: '100%', padding: '14px', background: '#fff', color: '#000', border: 'none', borderRadius: '8px', fontSize: '16px', fontWeight: '700', cursor: 'pointer' },
-  skipBtn:         { display: 'block', width: '100%', padding: '12px', marginTop: '16px', background: 'transparent', color: '#666', border: 'none', fontSize: '14px', cursor: 'pointer' },
-  cameraArea:      { flex: 1, position: 'relative', width: '100%', background: '#000', overflow: 'hidden' },
+  container:       { display: 'flex', flexDirection: 'column', height: '100vh', background: '#000', color: '#fff' },
+  panel:           { padding: '40px 24px', maxWidth: '400px', width: '100%', margin: '0 auto' },
+  heading:         { fontSize: '28px', fontWeight: '700', marginBottom: '8px' },
+  sub:             { fontSize: '15px', color: '#aaa', marginBottom: '8px', lineHeight: '1.5' },
+  ratioText:       { fontSize: '13px', color: '#666', marginBottom: '32px' },
+  primaryBtn:      { display: 'block', width: '100%', padding: '16px', background: '#fff', color: '#000', border: 'none', borderRadius: '12px', fontSize: '17px', fontWeight: '700', cursor: 'pointer', marginBottom: '12px' },
+  skipBtn:         { display: 'block', width: '100%', padding: '12px', background: 'transparent', color: '#666', border: 'none', fontSize: '14px', cursor: 'pointer', marginTop: '8px' },
+  cameraArea:      { flex: 1, position: 'relative', background: '#000', overflow: 'hidden' },
   video:           { position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', objectFit: 'cover' },
   canvas:          { position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' },
-  infoPanel:       { padding: '20px 24px', background: '#111', flexShrink: 0, width: '100%', boxSizing: 'border-box' },
-  stepLabel:       { fontSize: '12px', color: '#888', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.05em' },
-  instructionText: { fontSize: '20px', fontWeight: '600', marginBottom: '16px' },
+  infoPanel:       { padding: '20px 24px 28px', background: '#111', flexShrink: 0 },
+  headerRow:       { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' },
+  stepLabel:       { fontSize: '12px', color: '#888', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '2px' },
+  repCounter:      { fontSize: '15px', fontWeight: '600' },
+  existingLabel:   { fontSize: '12px', color: '#555' },
+  instructionText: { fontSize: '22px', fontWeight: '600', marginBottom: '16px' },
   progressTrack:   { height: '6px', background: '#333', borderRadius: '3px', overflow: 'hidden', marginBottom: '16px' },
   progressFill:    { height: '100%', background: '#4CAF50', transition: 'width 0.1s linear' },
+  repDots:         { display: 'flex', gap: '8px', marginBottom: '16px' },
+  dot:             { width: '12px', height: '12px', borderRadius: '50%' },
   errorText:       { color: 'red', padding: '16px', fontSize: '14px' },
 }

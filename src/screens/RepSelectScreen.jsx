@@ -20,23 +20,10 @@ function RepSelectScreen() {
   }
 
   const handleStart = () => {
-    const num = parseInt(reps, 10)
-
-    if (!reps || isNaN(num)) {
-      setError('Please enter a number')
-      return
-    }
-    if (num < 1 || num > 15) {
-      setError('Please enter a number between 1 and 15')
-      return
-    }
-    if (liftId === 'bench'){
-      navigate('/calibrate/${liftId}/${angle}/${num}')
-    } else{
-      navigate(`/camera/${liftId}/${angle}/${num}`)
-    }
-
-    navigate(`/camera/${liftId}/${angle}/${num}`)
+  const num = parseInt(reps, 10)
+  if (!reps || isNaN(num)) { setError('Please enter a number'); return }
+  if (num < 1 || num > 15) { setError('Please enter a number between 1 and 15'); return }
+  navigate(`/camera/${liftId}/${angle}/${num}`)
   }
 
   const handleBack = () => {
