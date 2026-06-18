@@ -1,7 +1,8 @@
 import { computeAngles, checkDepth, pickBestSide,
          lateralityScore, classifyCamera,
          handFootDistance, euclideanDistance,
-         benchPickBestSide, computeElbowAngle } from './poseUtils.js'
+         benchPickBestSide, computeElbowAngle,
+         getBenchSideLandmarkKeys } from './poseUtils.js'
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
 export const SquatState = {
@@ -641,6 +642,9 @@ export class BenchReferee {
     this.repResults = []
     this._faults    = []
 
+    this._lockedSide          = null
+    this._trackedLandmarkKeys = []
+
     this._lockoutFrames       = 0
     this._chestFrames         = 0
     this._elbowAngleHistory   = []
@@ -669,6 +673,9 @@ export class BenchReferee {
     this._pressCommandFired   = false
     this._startCommandFired   = false
     this._chestReached        = false
+
+    // Do NOT clear _lockedSide here.
+    // Once selected at setup, the side remains locked for the whole set.
   }
 
   _addFault(fault) {
@@ -736,12 +743,40 @@ export class BenchReferee {
     return h[h.length - 1] > minPrev + 3
   }
 
+  _getSide(landmarks) {
+    const detectedSide = benchPickBestSide(landmarks)
+
+    // If side is already locked, never switch.
+    if (this._lockedSide) return this._lockedSide
+
+    return detectedSide
+  }
+
+  _lockSide(side) {
+    if (!side) return
+
+    this._lockedSide = side
+
+    // Bench side view tracks closest-side upper + lower landmarks.
+    // Lower-body landmarks are passive for now.
+    if (this.angle === 'side') {
+      this._trackedLandmarkKeys = getBenchSideLandmarkKeys(side)
+    } else {
+      // For front view, lower body should be ignored.
+      // Current command logic still uses selected arm side.
+      this._trackedLandmarkKeys = [
+        'left_shoulder', 'left_elbow', 'left_wrist',
+        'right_shoulder', 'right_elbow', 'right_wrist',
+      ]
+    }
+
+    console.log(`[BenchReferee] locked side: ${side}`)
+  }
+
   _isAtChest(landmarks, side, elbowAngle, wristVelocity) {
     const wristStill = wristVelocity < this.VELOCITY_THRESHOLD
 
     if (this.calibration) {
-      // New calibration format does not store side.
-      // Use current best visible side unless old calibration side exists.
       const calSide  = this.calibration.side || side
       const shoulder = landmarks[`${calSide}_shoulder`]
       const wrist    = landmarks[`${calSide}_wrist`]
@@ -758,12 +793,12 @@ export class BenchReferee {
       }
     }
 
-    // Fallback if no calibration
+    // Fallback if no calibration.
     return elbowAngle < 100 && wristStill && this._elbowAtLocalMinimum()
   }
 
   update(landmarks, barY = null) {
-    const side = benchPickBestSide(landmarks)
+    const side = this._getSide(landmarks)
     if (!side) return this._emptyReturn()
 
     const elbowAngle = computeElbowAngle(landmarks, side)
@@ -798,6 +833,10 @@ export class BenchReferee {
         this._lockoutFrames++
 
         if (this._lockoutFrames >= this.SETUP_HOLD_FRAMES) {
+          // Lock the side here.
+          // From now until reset, only this side affects judging/commands.
+          this._lockSide(side)
+
           this.state              = BenchState.LOCKOUT
           this._lockoutFrames     = 0
           this._startCommandFired = false
@@ -822,7 +861,7 @@ export class BenchReferee {
               this.result = LiftResult.WHITE
               this.state  = BenchState.COMPLETE
             } else {
-              // Stay at lockout. Wait for next START and next descent.
+              // Stay at lockout. Wait for next START and next actual descent.
               this._resetForNextRepTop()
               this.state = BenchState.LOCKOUT
             }
@@ -939,6 +978,8 @@ export class BenchReferee {
       totalReps:  this.totalReps,
       repResults: this.repResults,
       side,
+      lockedSide: this._lockedSide,
+      trackedLandmarkKeys: this._trackedLandmarkKeys,
       elbowAngle,
       wristVelocity,
       atChest,
@@ -956,6 +997,8 @@ export class BenchReferee {
       totalReps:  this.totalReps,
       repResults: this.repResults,
       side:       null,
+      lockedSide: this._lockedSide,
+      trackedLandmarkKeys: this._trackedLandmarkKeys,
     }
   }
 }

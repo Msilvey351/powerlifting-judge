@@ -1,18 +1,25 @@
 // ── Landmark indices ──────────────────────────────────────────────────────────
 // These match MediaPipe's 33-point pose model - same in Python and JS
 export const LANDMARK_INDICES = {
-  left_shoulder:  11,
-  right_shoulder: 12,
-  left_elbow:     13,
-  right_elbow:    14,
-  left_wrist:     15,
-  right_wrist:    16,
-  left_hip:       23,
-  right_hip:      24,
-  left_knee:      25,
-  right_knee:     26,
-  left_ankle:     27,
-  right_ankle:    28,
+  left_shoulder:    11,
+  right_shoulder:   12,
+  left_elbow:       13,
+  right_elbow:      14,
+  left_wrist:       15,
+  right_wrist:      16,
+
+  left_hip:         23,
+  right_hip:        24,
+  left_knee:        25,
+  right_knee:       26,
+  left_ankle:       27,
+  right_ankle:      28,
+
+  // Foot landmarks — useful for bench foot/leg tracking later
+  left_heel:        29,
+  right_heel:       30,
+  left_foot_index:  31,
+  right_foot_index: 32,
 }
 
 /**
@@ -22,21 +29,23 @@ export const LANDMARK_INDICES = {
  */
 export function extractLandmarks(rawLandmarks) {
   const result = {}
+
   for (const [name, idx] of Object.entries(LANDMARK_INDICES)) {
     const lm = rawLandmarks[idx]
+
     result[name] = {
       x:          lm.x,
       y:          lm.y,
       z:          lm.z,
-      visibility: lm.visibility ?? 1.0
+      visibility: lm.visibility ?? 1.0,
     }
   }
+
   return result
 }
 
 /**
  * Angle at point b, given three points a, b, c.
- * Direct port of angle_between() from Python prototype.
  */
 export function angleBetween(a, b, c) {
   const ba = { x: a.x - b.x, y: a.y - b.y }
@@ -52,7 +61,6 @@ export function angleBetween(a, b, c) {
 
 /**
  * Compute knee and hip angles for the given side.
- * Direct port of compute_angles() from Python prototype.
  */
 export function computeAngles(landmarks, side) {
   const hip      = landmarks[`${side}_hip`]
@@ -69,7 +77,6 @@ export function computeAngles(landmarks, side) {
 /**
  * How far apart are the hips horizontally?
  * Low score = side-on, high score = front-facing.
- * Direct port of laterality_score() from Python prototype.
  */
 export function lateralityScore(landmarks) {
   return Math.abs(landmarks.left_hip.x - landmarks.right_hip.x)
@@ -77,7 +84,6 @@ export function lateralityScore(landmarks) {
 
 /**
  * Classify camera angle based on hip separation.
- * Direct port of classify_camera() from Python prototype.
  */
 export function classifyCamera(score) {
   if (score < 0.08) return 'side-on'
@@ -86,19 +92,20 @@ export function classifyCamera(score) {
 }
 
 /**
- * Pick whichever side (left/right) has better landmark visibility.
- * Direct port of pick_best_side() from Python prototype.
+ * Pick whichever side has better lower-body landmark visibility.
+ * Used by squat/deadlift.
  */
 export function pickBestSide(landmarks, minVisibility = 0.5) {
   const leftScore = Math.min(
-    landmarks.left_hip.visibility,
-    landmarks.left_knee.visibility,
-    landmarks.left_ankle.visibility
+    landmarks.left_hip?.visibility   ?? 0,
+    landmarks.left_knee?.visibility  ?? 0,
+    landmarks.left_ankle?.visibility ?? 0,
   )
+
   const rightScore = Math.min(
-    landmarks.right_hip.visibility,
-    landmarks.right_knee.visibility,
-    landmarks.right_ankle.visibility
+    landmarks.right_hip?.visibility   ?? 0,
+    landmarks.right_knee?.visibility  ?? 0,
+    landmarks.right_ankle?.visibility ?? 0,
   )
 
   const best      = leftScore >= rightScore ? 'left' : 'right'
@@ -110,7 +117,6 @@ export function pickBestSide(landmarks, minVisibility = 0.5) {
 /**
  * Check whether the lifter has reached squat depth.
  * Hip crease must be below the top of the knee.
- * Direct port of check_depth() from Python prototype.
  * Note: in normalised coordinates Y increases downward,
  * so hip.y > knee.y means hip is lower than knee.
  */
@@ -132,14 +138,13 @@ export function checkDepth(landmarks, side, camera) {
   const angles = computeAngles(landmarks, side)
   return {
     atDepth: angles.hip < 105 && yMargin > -0.01,
-    margin:  yMargin
+    margin:  yMargin,
   }
 }
 
 /**
  * Calculate hand to foot distance for front view deadlift detection.
  * Uses average of both sides for robustness.
- * Returns normalised distance (0-1).
  */
 export function handFootDistance(landmarks) {
   const leftDist  = Math.abs(landmarks.left_wrist.y  - landmarks.left_ankle.y)
@@ -147,33 +152,70 @@ export function handFootDistance(landmarks) {
   return (leftDist + rightDist) / 2
 }
 
+// ── Bench press helpers ───────────────────────────────────────────────────────
 
-// ── Bench press additions ─────────────────────────────────────────────────────
-
+/**
+ * Euclidean distance between two landmarks.
+ * Rotation-invariant.
+ */
 export function euclideanDistance(a, b) {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
 }
 
+/**
+ * Pick best visible arm side for bench press.
+ * Uses shoulder, elbow, wrist visibility only.
+ */
 export function benchPickBestSide(landmarks, minVisibility = 0.5) {
   const leftScore = Math.min(
-    landmarks.left_shoulder?.visibility  ?? 0,
-    landmarks.left_elbow?.visibility     ?? 0,
-    landmarks.left_wrist?.visibility     ?? 0,
+    landmarks.left_shoulder?.visibility ?? 0,
+    landmarks.left_elbow?.visibility    ?? 0,
+    landmarks.left_wrist?.visibility    ?? 0,
   )
+
   const rightScore = Math.min(
     landmarks.right_shoulder?.visibility ?? 0,
     landmarks.right_elbow?.visibility    ?? 0,
     landmarks.right_wrist?.visibility    ?? 0,
   )
+
   const best      = leftScore >= rightScore ? 'left' : 'right'
   const bestScore = best === 'left' ? leftScore : rightScore
+
   return bestScore > minVisibility ? best : null
 }
 
+/**
+ * Compute elbow angle for bench press.
+ * 180° = locked out.
+ * Lower value = arm more bent.
+ */
 export function computeElbowAngle(landmarks, side) {
   const shoulder = landmarks[`${side}_shoulder`]
   const elbow    = landmarks[`${side}_elbow`]
   const wrist    = landmarks[`${side}_wrist`]
+
   if (!shoulder || !elbow || !wrist) return null
   return angleBetween(shoulder, elbow, wrist)
+}
+
+/**
+ * Closest-side landmarks that bench side view should track.
+ *
+ * Important distinction:
+ * - shoulder/elbow/wrist are used for commands and judging
+ * - hip/knee/ankle/heel/foot_index are tracked passively for future faults
+ * - far side is ignored
+ */
+export function getBenchSideLandmarkKeys(side) {
+  return [
+    `${side}_shoulder`,
+    `${side}_elbow`,
+    `${side}_wrist`,
+    `${side}_hip`,
+    `${side}_knee`,
+    `${side}_ankle`,
+    `${side}_heel`,
+    `${side}_foot_index`,
+  ]
 }
