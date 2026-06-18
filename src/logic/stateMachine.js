@@ -640,26 +640,42 @@ export class BenchReferee {
     this.currentRep = 0
     this.repResults = []
     this._faults    = []
-    this._resetForNextRep()
+
+    this._lockoutFrames       = 0
+    this._chestFrames         = 0
+    this._elbowAngleHistory   = []
+    this._wristHistory        = []
+
+    this._repInProgress       = false
+    this._pendingCompletion   = false
+    this._pressCommandFired   = false
+    this._startCommandFired   = false
+    this._chestReached        = false
   }
 
   reset() {
     this._reset()
   }
 
-  _resetForNextRep() {
-    this._faults            = []
-    this._lockoutFrames     = 0
-    this._chestFrames       = 0
-    this._commandFired      = false
-    this._elbowAngleHistory = []
-    this._wristHistory      = []
-    this._descendStarted    = false
-    this._chestReached      = false
+  _resetForNextRepTop() {
+    this._faults              = []
+    this._lockoutFrames       = 0
+    this._chestFrames         = 0
+    this._elbowAngleHistory   = []
+    this._wristHistory        = []
+
+    this._repInProgress       = false
+    this._pendingCompletion   = false
+    this._pressCommandFired   = false
+    this._startCommandFired   = false
+    this._chestReached        = false
   }
 
   _addFault(fault) {
-    if (!this._faults.includes(fault)) this._faults.push(fault)
+    if (!this._faults.includes(fault)) {
+      this._faults.push(fault)
+      console.log(`[FAULT] Bench rep ${this.currentRep}: ${fault}`)
+    }
   }
 
   _giveCommand(command) {
@@ -669,53 +685,80 @@ export class BenchReferee {
 
   _completeRep() {
     const repResult = this._chestReached && this._faults.length === 0
-      ? LiftResult.WHITE : LiftResult.RED
+      ? LiftResult.WHITE
+      : LiftResult.RED
+
     const reasons = this._chestReached
       ? [...this._faults]
       : ['Bar did not reach chest', ...this._faults]
+
     this.repResults.push({
       rep:    this.currentRep,
       result: repResult,
       faults: repResult === LiftResult.RED ? reasons : [],
     })
+
+    console.log(
+      `[BENCH REP ${this.currentRep}] ${repResult}` +
+      (repResult === LiftResult.RED ? ` — ${reasons.join(', ')}` : '')
+    )
   }
 
   _updateWristHistory(landmarks, side) {
     const wrist = landmarks[`${side}_wrist`]
     if (!wrist) return Infinity
+
     this._wristHistory.push({ x: wrist.x, y: wrist.y })
     if (this._wristHistory.length > 5) this._wristHistory.shift()
+
     if (this._wristHistory.length < 2) return Infinity
+
     const prev = this._wristHistory[this._wristHistory.length - 2]
     const curr = this._wristHistory[this._wristHistory.length - 1]
+
     return Math.sqrt((curr.x - prev.x) ** 2 + (curr.y - prev.y) ** 2)
   }
 
   _updateElbowHistory(elbowAngle) {
     this._elbowAngleHistory.push(elbowAngle)
-    if (this._elbowAngleHistory.length > 8) this._elbowAngleHistory.shift()
+    if (this._elbowAngleHistory.length > 8) {
+      this._elbowAngleHistory.shift()
+    }
   }
 
   _elbowAtLocalMinimum() {
     const h = this._elbowAngleHistory
     if (h.length < 4) return false
-    const minPrev = Math.min(...h.slice(0, -1))
+
+    const previous = h.slice(0, -1)
+    const minPrev  = Math.min(...previous)
+
     return h[h.length - 1] > minPrev + 3
   }
 
   _isAtChest(landmarks, side, elbowAngle, wristVelocity) {
     const wristStill = wristVelocity < this.VELOCITY_THRESHOLD
+
     if (this.calibration) {
-      const calSide  = this.calibration.side
+      // New calibration format does not store side.
+      // Use current best visible side unless old calibration side exists.
+      const calSide  = this.calibration.side || side
       const shoulder = landmarks[`${calSide}_shoulder`]
       const wrist    = landmarks[`${calSide}_wrist`]
-      if (shoulder && wrist) {
-        const currentRatio = euclideanDistance(shoulder, wrist) /
-                             this.calibration.armExtendedDistance
-        return currentRatio <= this.calibration.chestRatio + this.CHEST_RATIO_TOLERANCE
-          && wristStill && this._elbowAtLocalMinimum()
+
+      if (shoulder && wrist && this.calibration.armExtendedDistance) {
+        const currentRatio =
+          euclideanDistance(shoulder, wrist) / this.calibration.armExtendedDistance
+
+        return (
+          currentRatio <= this.calibration.chestRatio + this.CHEST_RATIO_TOLERANCE &&
+          wristStill &&
+          this._elbowAtLocalMinimum()
+        )
       }
     }
+
+    // Fallback if no calibration
     return elbowAngle < 100 && wristStill && this._elbowAtLocalMinimum()
   }
 
@@ -731,38 +774,92 @@ export class BenchReferee {
     const lockedOut     = elbowAngle >= this.ELBOW_LOCK_ANGLE
 
     this._updateElbowHistory(elbowAngle)
-    const atChest = this._isAtChest(landmarks, side, elbowAngle, wristVelocity)
 
-    // ── State machine ─────────────────────────────────────────────────────────
+    const atChest = this._isAtChest(
+      landmarks,
+      side,
+      elbowAngle,
+      wristVelocity
+    )
+
+    // ── WAITING ─────────────────────────────────────────────────────────────
     if (this.state === BenchState.WAITING) {
       if (lockedOut) {
         this.state          = BenchState.SETUP
         this._lockoutFrames = 0
       }
 
+    // ── SETUP ───────────────────────────────────────────────────────────────
     } else if (this.state === BenchState.SETUP) {
       if (!lockedOut) {
-        this.state = BenchState.WAITING
+        this.state          = BenchState.WAITING
+        this._lockoutFrames = 0
       } else if (wristStill) {
         this._lockoutFrames++
+
         if (this._lockoutFrames >= this.SETUP_HOLD_FRAMES) {
-          this.state = BenchState.LOCKOUT
+          this.state              = BenchState.LOCKOUT
+          this._lockoutFrames     = 0
+          this._startCommandFired = false
         }
       } else {
         this._lockoutFrames = Math.max(0, this._lockoutFrames - 1)
       }
 
+    // ── LOCKOUT ─────────────────────────────────────────────────────────────
     } else if (this.state === BenchState.LOCKOUT) {
-      if (!lockedOut) {
-        // Rep starts here — increment rep count on descent
-        this.currentRep++
-        this._giveCommand('start')
-        this._elbowAngleHistory = []
-        this._wristHistory      = []
-        this._descendStarted    = true
-        this.state              = BenchState.DESCENDING
+      // If a rep has just been pressed to lockout, confirm lockout and complete it.
+      if (this._pendingCompletion) {
+        if (lockedOut && wristStill) {
+          this._lockoutFrames++
+
+          if (this._lockoutFrames >= this.LOCKOUT_HOLD_FRAMES) {
+            this._pendingCompletion = false
+            this._completeRep()
+
+            if (this.currentRep >= this.totalReps) {
+              this._giveCommand('rack')
+              this.result = LiftResult.WHITE
+              this.state  = BenchState.COMPLETE
+            } else {
+              // Stay at lockout. Wait for next START and next descent.
+              this._resetForNextRepTop()
+              this.state = BenchState.LOCKOUT
+            }
+          }
+        } else {
+          this._lockoutFrames = Math.max(0, this._lockoutFrames - 1)
+        }
+
+      // Stable top position before a rep. Give START once.
+      } else if (!this._repInProgress && this.currentRep < this.totalReps) {
+        if (lockedOut && wristStill && !this._startCommandFired) {
+          this._lockoutFrames++
+
+          if (this._lockoutFrames >= this.LOCKOUT_HOLD_FRAMES) {
+            this._giveCommand('start')
+            this._startCommandFired = true
+            this._lockoutFrames     = 0
+          }
+        }
+
+        // Rep starts only when the lifter actually descends.
+        if (!lockedOut) {
+          this.currentRep++
+
+          this._repInProgress     = true
+          this._chestReached      = false
+          this._pressCommandFired = false
+          this._lockoutFrames     = 0
+          this._chestFrames       = 0
+          this._elbowAngleHistory = []
+          this._wristHistory      = []
+
+          this.state = BenchState.DESCENDING
+        }
       }
 
+    // ── DESCENDING ──────────────────────────────────────────────────────────
     } else if (this.state === BenchState.DESCENDING) {
       if (atChest) {
         this._chestReached = true
@@ -770,70 +867,64 @@ export class BenchReferee {
         this.state         = BenchState.CHEST
       }
 
+      // If they go back to lockout without chest, complete as red.
+      if (lockedOut && this._repInProgress && !this._chestReached) {
+        this._addFault('Bar did not reach chest')
+        this._pendingCompletion = true
+        this._lockoutFrames     = 0
+        this.state              = BenchState.LOCKOUT
+      }
+
+    // ── CHEST ───────────────────────────────────────────────────────────────
     } else if (this.state === BenchState.CHEST) {
-      if (!atChest && !wristStill) {
-        this.state = BenchState.PRESSING
-      } else if (wristStill) {
+      if (atChest && wristStill) {
         this._chestFrames++
-        if (this._chestFrames >= this.CHEST_HOLD_FRAMES) {
+
+        if (
+          this._chestFrames >= this.CHEST_HOLD_FRAMES &&
+          !this._pressCommandFired
+        ) {
           this._giveCommand('press')
+          this._pressCommandFired = true
         }
+
+      } else if (!atChest && !wristStill) {
+        this.state = BenchState.PRESSING
       }
 
+    // ── PRESSING ────────────────────────────────────────────────────────────
     } else if (this.state === BenchState.PRESSING) {
+      // If it drops back to chest, return to chest state.
       if (atChest) {
-        // bar dropped back to chest
         this.state = BenchState.CHEST
-        return this._buildReturn(side, elbowAngle, wristVelocity, atChest)
       }
+
+      // Rep is only completed after lockout is held.
       if (lockedOut) {
-        this.state           = BenchState.LOCKOUT
-        this._lockoutFrames  = 0
-        this._commandFired   = false
-        this._descendStarted = false
+        this._pendingCompletion = true
+        this._lockoutFrames     = 0
+        this.state              = BenchState.LOCKOUT
       }
+
+    } else if (this.state === BenchState.COMPLETE) {
+      // stay complete
     }
 
-    // ── Lockout hold after completing a rep ───────────────────────────────────
-    // Only fires after a full descent (_descendStarted was true before PRESSING
-    // reset it to false). We check the flag we set in PRESSING → LOCKOUT.
-    // Use a separate flag _repLockoutPending to avoid re-triggering.
-    if (this.state === BenchState.LOCKOUT && this.currentRep > 0 && !this._commandFired) {
-      if (wristStill) {
-        this._lockoutFrames++
-        if (this._lockoutFrames >= this.LOCKOUT_HOLD_FRAMES) {
-          this._commandFired = true
-          this._completeRep()
-
-          if (this.currentRep >= this.totalReps) {
-            this._giveCommand('rack')
-            this.result = LiftResult.WHITE
-            this.state  = BenchState.COMPLETE
-          } else {
-            // Next rep — go to DESCENDING, rep count increments on next descent
-            this._giveCommand('start')
-            this._resetForNextRep()
-            this._elbowAngleHistory = []
-            this._wristHistory      = []
-            this.state              = BenchState.DESCENDING
-          }
-        }
-      } else {
-        this._lockoutFrames = Math.max(0, this._lockoutFrames - 1)
-      }
-    }
-
-    return this._buildReturn(side, elbowAngle, wristVelocity, atChest)
+    return this._buildReturn(side, elbowAngle, wristVelocity, atChest, barY)
   }
 
-  _buildReturn(side, elbowAngle, wristVelocity, atChest) {
+  _buildReturn(side, elbowAngle, wristVelocity, atChest, barY = null) {
     const wristStill = wristVelocity < this.VELOCITY_THRESHOLD
     const lockedOut  = elbowAngle >= this.ELBOW_LOCK_ANGLE
-    const progress   = this.state === BenchState.SETUP
+
+    const progress = this.state === BenchState.SETUP
       ? this._lockoutFrames / this.SETUP_HOLD_FRAMES
       : this.state === BenchState.CHEST
         ? this._chestFrames / this.CHEST_HOLD_FRAMES
-        : 0
+        : this.state === BenchState.LOCKOUT
+          ? this._lockoutFrames / this.LOCKOUT_HOLD_FRAMES
+          : 0
+
     return {
       state:      this.state,
       result:     this.result,
@@ -849,6 +940,9 @@ export class BenchReferee {
       repResults: this.repResults,
       side,
       elbowAngle,
+      wristVelocity,
+      atChest,
+      barY,
     }
   }
 
