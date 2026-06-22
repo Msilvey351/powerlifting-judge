@@ -7,7 +7,7 @@ import { computeAngles, checkDepth, pickBestSide,
 
 import { ConcentricVelocityTracker } from './velocityTracker.js'
 import { estimateMetresPerNormUnit } from './velocityScale.js'
-
+import { DownwardMovementDetector, getWristProxyY } from './downwardMovement.js'
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
 export const SquatState = {
@@ -132,6 +132,7 @@ export class SquatReferee {
     this._faults         = []
     this._lastSide       = null
     this._velocityTracker = new ConcentricVelocityTracker()
+    this._downwardDetector = new DownwardMovementDetector(0.025, 3)
     this._latestMetresPerNormUnit = null
     this._detector       = new StillnessDetector(
       [], this.stillnessFrames, this.stillnessThreshold
@@ -193,6 +194,7 @@ export class SquatReferee {
     this._faults         = []
     this._setupEntryTime = null
     this._velocityTracker.reset()
+    this._downwardDetector.reset()
     this._detector.reset()
   }
 
@@ -269,12 +271,28 @@ export class SquatReferee {
       if (!atDepth) {
         const hipY = landmarks[`${side}_hip`]?.y
         this._velocityTracker.start(hipY)
+
+        const wristY = getWristProxyY(landmarks)
+        if (wristY !== null){
+          this._downwardDetector.start(wristY)
+        }
         this.state = SquatState.ASCENDING
       }
 
     } else if (this.state === SquatState.ASCENDING) {
       const hipY = landmarks[`${side}_hip`]?.y
       this._velocityTracker.add(hipY)
+
+      const wristY = getWristProxyY(landmarks)
+
+      if (wristY !== null) {
+        if (!this._downwardDetector.active) {
+          this._downwardDetector.start(wristY)
+        } else if (this._downwardDetector.update(wristY)){
+          this._addFault('Downward movement after ascent began')
+        }
+      }
+
 
       if (kneeLocked) this.state = SquatState.LOCKOUT
 
@@ -394,6 +412,7 @@ export class DeadliftReferee {
     this._confirmedHinge    = false
     this._velocityTracker   = new ConcentricVelocityTracker()
     this._latestMetresPerNormUnit = null
+    this._downwardDetector = new DownwardMovementDetector(0.015, 3)
     this._lastSide          = null
     this._detector          = new StillnessDetector(
       [], this.stillnessFrames, this.stillnessThreshold
@@ -453,6 +472,7 @@ export class DeadliftReferee {
     this._handDistHistory = []
     this._confirmedHinge  = false
     this._velocityTracker.reset()
+    this._downwardDetector.reset()
   }
 
   _isHipLocked(landmarks, side, angles) {
@@ -578,6 +598,11 @@ export class DeadliftReferee {
         const y = this._getDeadliftVelocityY(landmarks, side)
         this._velocityTracker.start(y)
 
+        const wristY = getWristProxyY(landmarks)
+        if (wristY !== null) {
+          this._downwardDetector.start(wristY)
+        }
+
         this.currentRep++
         this.state = DeadliftState.PULLING
       }
@@ -589,6 +614,16 @@ export class DeadliftReferee {
     } else if (this.state === DeadliftState.PULLING) {
       const y = this._getDeadliftVelocityY(landmarks, side)
       this._velocityTracker.add(y)
+
+      const wristY = getWristProxyY(landmarks)
+
+      if (wristY !== null) {
+        if (!this._downwardDetector.active) {
+          this._downwardDetector.start(wristY)
+        } else if (this._downwardDetector.update(wristY)) {
+          this._addFault('Downward movement during pull')
+        }
+      }
 
       if (kneeLocked && hipLocked) {
         this.state          = DeadliftState.LOCKOUT
@@ -730,6 +765,7 @@ export class BenchReferee {
 
     this._velocityTracker = new ConcentricVelocityTracker()
     this._latestMetresPerNormUnit = null
+    this._downwardDetector = new DownwardMovementDetector(0.015, 3)
   }
 
   reset() {
@@ -750,6 +786,7 @@ export class BenchReferee {
     this._chestReached        = false
 
     this._velocityTracker.reset()
+    this._downwardDetector.reset()
 
     // Do NOT clear _lockedSide here.
     // Once selected at setup, the side remains locked for the whole set.
@@ -1016,6 +1053,12 @@ export class BenchReferee {
       } else if (!atChest && !wristStill) {
         const y = this._getBenchVelocityY(landmarks, side, barY)
         this._velocityTracker.start(y)
+
+        const wristY = getWristProxyY(landmarks)
+        if (wristY !== null) {
+          this._downwardDetector.start(wristY)
+        }
+
         this.state = BenchState.PRESSING
       }
 
@@ -1023,6 +1066,16 @@ export class BenchReferee {
     } else if (this.state === BenchState.PRESSING) {
       const y = this._getBenchVelocityY(landmarks, side, barY)
       this._velocityTracker.add(y)
+
+      const wristY = getWristProxyY(landmarks)
+
+      if (wristY !== null) {
+        if (!this._downwardDetector.active) {
+          this._downwardDetector.start(wristY)
+        } else if (this._downwardDetector.update(wristY)) {
+          this._addFault('Downward movement during press')
+        }
+      }
 
       // If it drops back to chest, return to chest state.
       if (atChest) {
