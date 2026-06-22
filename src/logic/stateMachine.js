@@ -97,6 +97,81 @@ class StillnessDetector {
   }
 }
 
+// ── ConcentricVelocityTracker ────────────────────────────────────────────────
+// Tracks upward/concentric velocity in normalised screen units per second.
+// y decreases as the lifter/bar moves upward, so positive velocity = previousY - currentY.
+class ConcentricVelocityTracker {
+  constructor() {
+    this.reset()
+  }
+
+  reset() {
+    this.samples = []
+    this.started = false
+  }
+
+  start(y) {
+    const t = performance.now()
+    this.samples = [{ t, y }]
+    this.started = true
+  }
+
+  add(y) {
+    if (!this.started || y == null || Number.isNaN(y)) return
+
+    const t = performance.now()
+    const last = this.samples[this.samples.length - 1]
+
+    // Avoid duplicate/zero-time samples
+    if (!last || t <= last.t) return
+
+    this.samples.push({ t, y })
+
+    // Keep memory bounded
+    if (this.samples.length > 300) this.samples.shift()
+  }
+
+  getMetrics() {
+    if (!this.started || this.samples.length < 2) {
+      return null
+    }
+
+    const first = this.samples[0]
+    const last  = this.samples[this.samples.length - 1]
+
+    const durationSec = (last.t - first.t) / 1000
+    if (durationSec <= 0) return null
+
+    // Positive distance = upward displacement
+    const distanceNorm = first.y - last.y
+    const avgVelocityNorm = distanceNorm / durationSec
+
+    let peakVelocityNorm = 0
+
+    for (let i = 1; i < this.samples.length; i++) {
+      const prev = this.samples[i - 1]
+      const curr = this.samples[i]
+      const dt   = (curr.t - prev.t) / 1000
+      if (dt <= 0) continue
+
+      const v = (prev.y - curr.y) / dt
+
+      // Only count upward/concentric velocity
+      if (v > peakVelocityNorm) {
+        peakVelocityNorm = v
+      }
+    }
+
+    return {
+      unit: 'norm/s',
+      distanceNorm,
+      durationSec,
+      avgVelocityNorm,
+      peakVelocityNorm,
+    }
+  }
+}
+
 // ── SquatReferee ──────────────────────────────────────────────────────────────
 export class SquatReferee {
   constructor(onCommand, totalReps = 1, stillnessFrames = 30, stillnessThreshold = 0.02) {
@@ -122,6 +197,7 @@ export class SquatReferee {
     this._depthAchieved  = false
     this._faults         = []
     this._lastSide       = null
+    this._velocityTracker = new ConcentricVelocityTracker()
     this._detector       = new StillnessDetector(
       [], this.stillnessFrames, this.stillnessThreshold
     )
@@ -170,6 +246,7 @@ export class SquatReferee {
       rep:    this.currentRep,
       result: repResult,
       faults: repResult === LiftResult.RED ? reasons : [],
+      velocity: this._velocityTracker.getMetrics(),
     })
 
     console.log(`[REP ${this.currentRep}] ${repResult}${repResult === LiftResult.RED ? ' — ' + reasons.join(', ') : ''}`)
@@ -180,6 +257,7 @@ export class SquatReferee {
     this._hasMoved       = false
     this._faults         = []
     this._setupEntryTime = null
+    this._velocityTracker.reset()
     this._detector.reset()
   }
 
@@ -245,9 +323,16 @@ export class SquatReferee {
       }
 
     } else if (this.state === SquatState.DEPTH_ACHIEVED) {
-      if (!atDepth) this.state = SquatState.ASCENDING
+      if (!atDepth) {
+        const hipY = landmarks[`${side}_hip`]?.y
+        this._velocityTracker.start(hipY)
+        this.state = SquatState.ASCENDING
+      }
 
     } else if (this.state === SquatState.ASCENDING) {
+      const hipY = landmarks[`${side}_hip`]?.y
+      this._velocityTracker.add(hipY)
+
       if (kneeLocked) this.state = SquatState.LOCKOUT
 
     } else if (this.state === SquatState.LOCKOUT) {
