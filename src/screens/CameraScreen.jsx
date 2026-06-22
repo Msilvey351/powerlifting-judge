@@ -5,6 +5,7 @@ import { initAudio, speakCommand }   from '../logic/audio'
 import { extractLandmarks }          from '../logic/poseUtils'
 import { BarDetector }               from '../logic/barDetector'
 import { getCalibration }            from '../logic/calibrationStore'
+import { getUserProfile }            from '../logic/userProfileStore'
 import {
   SquatReferee,
   DeadliftReferee,
@@ -81,14 +82,12 @@ function CameraScreen() {
 
           const landmarks = extractLandmarks(rawLandmarks)
 
-          // Bar detection for bench
           let barY = null
           if (isBench && barDetectorRef.current) {
             const wristY = landmarks.left_wrist?.y ?? landmarks.right_wrist?.y ?? null
             barY = barDetectorRef.current.processFrame(video, wristY)
           }
 
-          // State machine update
           const update = isBench
             ? referee.update(landmarks, barY)
             : referee.update(landmarks)
@@ -158,15 +157,16 @@ function CameraScreen() {
     const setup = async () => {
       await initAudio()
 
-      // Build correct referee
+      const userProfile = getUserProfile()
+
       if (isBench) {
         const calibration      = getCalibration('bench', angle.toLowerCase())
-        refereeRef.current     = new BenchReferee(handleCommand, totalReps, angle, calibration)
+        refereeRef.current     = new BenchReferee(handleCommand, totalReps, angle, calibration, userProfile)
         barDetectorRef.current = new BarDetector()
       } else if (isDeadlift) {
-        refereeRef.current = new DeadliftReferee(handleCommand, totalReps, angle)
+        refereeRef.current = new DeadliftReferee(handleCommand, totalReps, angle, 30, 0.02, userProfile)
       } else {
-        refereeRef.current = new SquatReferee(handleCommand, totalReps)
+        refereeRef.current = new SquatReferee(handleCommand, totalReps, angle, userProfile)
       }
 
       try {
@@ -198,7 +198,6 @@ function CameraScreen() {
     }
   }, [handleCommand, startCamera, totalReps, isBench, isDeadlift, angle])
 
-  // ── Handlers ────────────────────────────────────────────────────────────────
   const handleBack = () => navigate('/')
 
   const handleDismiss = () => {
@@ -209,7 +208,6 @@ function CameraScreen() {
     navigate('/')
   }
 
-  // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div style={styles.container}>
       <div style={styles.topBar}>

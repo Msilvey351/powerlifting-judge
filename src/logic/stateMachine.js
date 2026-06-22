@@ -6,6 +6,8 @@ import { computeAngles, checkDepth, pickBestSide,
 
 
 import { ConcentricVelocityTracker } from './velocityTracker.js'
+import { estimateMetresPerNormUnit } from './velocityScale.js'
+
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
 export const SquatState = {
@@ -103,7 +105,7 @@ class StillnessDetector {
 
 // ── SquatReferee ──────────────────────────────────────────────────────────────
 export class SquatReferee {
-  constructor(onCommand, totalReps = 1, stillnessFrames = 30, stillnessThreshold = 0.02) {
+  constructor(onCommand, totalReps = 1, angle = 'side' , userProfile = null, stillnessFrames = 30, stillnessThreshold = 0.02) {
     this.KNEE_LOCK_ANGLE    = 165
     this.HIP_UPRIGHT_ANGLE  = 150
     this.SETUP_HOLD_SECONDS = 2.0
@@ -112,6 +114,9 @@ export class SquatReferee {
     this.totalReps          = totalReps
     this.stillnessFrames    = stillnessFrames
     this.stillnessThreshold = stillnessThreshold
+
+    this.angle = angle.toLowerCase()
+    this.userProfile = userProfile
 
     this._reset()
   }
@@ -127,6 +132,7 @@ export class SquatReferee {
     this._faults         = []
     this._lastSide       = null
     this._velocityTracker = new ConcentricVelocityTracker()
+    this._latestMetresPerNormUnit = null
     this._detector       = new StillnessDetector(
       [], this.stillnessFrames, this.stillnessThreshold
     )
@@ -175,7 +181,7 @@ export class SquatReferee {
       rep:    this.currentRep,
       result: repResult,
       faults: repResult === LiftResult.RED ? reasons : [],
-      velocity: this._velocityTracker.getMetrics(),
+      velocity: this._velocityTracker.getMetrics(this._latestMetresPerNormUnit),
     })
 
     console.log(`[REP ${this.currentRep}] ${repResult}${repResult === LiftResult.RED ? ' — ' + reasons.join(', ') : ''}`)
@@ -215,6 +221,14 @@ export class SquatReferee {
 
     const kneeLocked = angles.knee >= this.KNEE_LOCK_ANGLE
     const hipUpright = angles.hip  >= this.HIP_UPRIGHT_ANGLE
+
+    this._latestMetresPerNormUnit = estimateMetresPerNormUnit(
+      'squat',
+      this.angle,
+      landmarks,
+      side,
+      this.userProfile
+    )
 
     if (this.state === SquatState.WAITING) {
       if (kneeLocked && hipUpright) {
@@ -329,7 +343,7 @@ export const DEADLIFT_STATE_MESSAGES = {
 
 // ── DeadliftReferee ───────────────────────────────────────────────────────────
 export class DeadliftReferee {
-  constructor(onCommand, totalReps = 1, angle = 'side', stillnessFrames = 30, stillnessThreshold = 0.02) {
+  constructor(onCommand, totalReps = 1, angle = 'side', stillnessFrames = 30, stillnessThreshold = 0.02, userProfile = null) {
     this.KNEE_LOCK_ANGLE      = 160
     this.HIP_LOCK_ANGLE       = 120
     this.HINGE_HIP_ANGLE      = 130
@@ -348,6 +362,8 @@ export class DeadliftReferee {
     this.angle              = angle.toLowerCase()
     this.stillnessFrames    = stillnessFrames
     this.stillnessThreshold = stillnessThreshold
+
+    this.userProfile = userProfile
 
     this._reset()
   }
@@ -377,6 +393,7 @@ export class DeadliftReferee {
     this._handDistHistory   = []
     this._confirmedHinge    = false
     this._velocityTracker   = new ConcentricVelocityTracker()
+    this._latestMetresPerNormUnit = null
     this._lastSide          = null
     this._detector          = new StillnessDetector(
       [], this.stillnessFrames, this.stillnessThreshold
@@ -422,7 +439,7 @@ export class DeadliftReferee {
       rep:      this.currentRep,
       result:   repResult,
       faults:   repResult === LiftResult.RED ? [...this._faults] : [],
-      velocity: this._velocityTracker.getMetrics(),
+      velocity: this._velocityTracker.getMetrics(this._latestMetresPerNormUnit),
     })
 
     console.log(`[REP ${this.currentRep}] ${repResult}`)
@@ -502,6 +519,14 @@ export class DeadliftReferee {
     const camera   = classifyCamera(score)
     const angles   = computeAngles(landmarks, side)
     const { isStill, progress } = this._updateDetector(landmarks, side)
+    this._latestMetresPerNormUnit = estimateMetresPerNormUnit(
+      'deadlift',
+      this.angle,
+      landmarks,
+      side,
+      this.userProfile
+    )
+
 
     let kneeLocked    = false
     let hipLocked     = false
@@ -656,7 +681,7 @@ export const BENCH_STATE_MESSAGES = {
 }
 
 export class BenchReferee {
-  constructor(onCommand, totalReps = 1, angle = 'side', calibration = null) {
+  constructor(onCommand, totalReps = 1, angle = 'side', calibration = null, userProfile = null) {
     this.ELBOW_LOCK_ANGLE      = 160
     this.CHEST_RATIO_TOLERANCE = 0.06
     this.VELOCITY_THRESHOLD    = 0.004
@@ -668,6 +693,8 @@ export class BenchReferee {
     this.totalReps   = totalReps
     this.angle       = angle.toLowerCase()
     this.calibration = calibration
+
+    this.userProfile = userProfile
 
     this._reset()
   }
@@ -702,6 +729,7 @@ export class BenchReferee {
     this._chestReached        = false
 
     this._velocityTracker = new ConcentricVelocityTracker()
+    this._latestMetresPerNormUnit = null
   }
 
   reset() {
@@ -752,7 +780,7 @@ export class BenchReferee {
       rep:      this.currentRep,
       result:   repResult,
       faults:   repResult === LiftResult.RED ? reasons : [],
-      velocity: this._velocityTracker.getMetrics(),
+      velocity: this._velocityTracker.getMetrics(this._latestMetresPerNormUnit),
     })
 
     console.log(
@@ -859,6 +887,14 @@ export class BenchReferee {
     const lockedOut     = elbowAngle >= this.ELBOW_LOCK_ANGLE
 
     this._updateElbowHistory(elbowAngle)
+
+    this._latestMetresPerNormUnit = estimateMetresPerNormUnit(
+      'bench',
+      this.angle,
+      landmarks,
+      side,
+      this.userProfile
+    )
 
     const atChest = this._isAtChest(
       landmarks,

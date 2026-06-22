@@ -1,18 +1,5 @@
 // src/logic/velocityTracker.js
 
-// Tracks concentric velocity in normalised screen units per second.
-//
-// MediaPipe y-coordinates increase downward.
-// Concentric movement for all three lifts is generally upward,
-// so positive concentric velocity is:
-//
-// previousY - currentY
-//
-// Units:
-//   norm/s = fraction of frame height per second
-//
-// Later this can be converted to m/s if we add a real-world scale calibration.
-
 export class ConcentricVelocityTracker {
   constructor() {
     this.reset()
@@ -41,13 +28,21 @@ export class ConcentricVelocityTracker {
 
     this.samples.push({ t, y })
 
-    // Keep memory bounded
     if (this.samples.length > 300) {
       this.samples.shift()
     }
   }
 
-  getMetrics() {
+  /**
+   * scale is optional:
+   * {
+   *   metresPerNormUnit,
+   *   source,
+   *   segment,
+   *   confidence
+   * }
+   */
+  getMetrics(scale = null) {
     if (!this.started || this.samples.length < 2) {
       return null
     }
@@ -58,7 +53,6 @@ export class ConcentricVelocityTracker {
     const durationSec = (last.t - first.t) / 1000
     if (durationSec <= 0) return null
 
-    // Positive distance = upward movement
     const distanceNorm = first.y - last.y
     const avgVelocityNorm = distanceNorm / durationSec
 
@@ -73,18 +67,32 @@ export class ConcentricVelocityTracker {
 
       const velocity = (prev.y - curr.y) / dt
 
-      // Only count upward/concentric movement.
       if (velocity > peakVelocityNorm) {
         peakVelocityNorm = velocity
       }
     }
 
-    return {
+    const metrics = {
       unit: 'norm/s',
       distanceNorm,
       durationSec,
       avgVelocityNorm,
       peakVelocityNorm,
     }
+
+    if (scale?.metresPerNormUnit) {
+      metrics.unit = 'm/s'
+      metrics.estimated = true
+      metrics.scaleSource = scale.source ?? 'height-estimate'
+      metrics.scaleSegment = scale.segment ?? null
+      metrics.scaleConfidence = scale.confidence ?? 'estimated'
+      metrics.metresPerNormUnit = scale.metresPerNormUnit
+
+      metrics.distanceM = distanceNorm * scale.metresPerNormUnit
+      metrics.avgVelocityMS = avgVelocityNorm * scale.metresPerNormUnit
+      metrics.peakVelocityMS = peakVelocityNorm * scale.metresPerNormUnit
+    }
+
+    return metrics
   }
 }

@@ -3,6 +3,23 @@ import { LiftResult } from '../logic/stateMachine'
 function formatVelocity(velocity) {
   if (!velocity) return null
 
+  // Prefer estimated m/s if available.
+  if (
+    velocity.avgVelocityMS != null &&
+    velocity.peakVelocityMS != null &&
+    !Number.isNaN(velocity.avgVelocityMS) &&
+    !Number.isNaN(velocity.peakVelocityMS)
+  ) {
+    return {
+      avg:       velocity.avgVelocityMS.toFixed(2),
+      peak:      velocity.peakVelocityMS.toFixed(2),
+      time:      velocity.durationSec?.toFixed(2),
+      unit:      'm/s',
+      estimated: true,
+      segment:   velocity.scaleSegment,
+    }
+  }
+
   const avg  = velocity.avgVelocityNorm
   const peak = velocity.peakVelocityNorm
   const time = velocity.durationSec
@@ -19,10 +36,12 @@ function formatVelocity(velocity) {
   }
 
   return {
-    avg:  avg.toFixed(3),
-    peak: peak.toFixed(3),
-    time: time.toFixed(2),
-    unit: velocity.unit ?? 'norm/s',
+    avg:       avg.toFixed(3),
+    peak:      peak.toFixed(3),
+    time:      time.toFixed(2),
+    unit:      velocity.unit ?? 'norm/s',
+    estimated: false,
+    segment:   null,
   }
 }
 
@@ -32,23 +51,18 @@ function ResultsOverlay({ repResults, totalReps, onDismiss }) {
   const firstVelocity = repResults.find(r => r.velocity)?.velocity
   const lastVelocity  = [...repResults].reverse().find(r => r.velocity)?.velocity
 
+  let firstAvg = firstVelocity?.avgVelocityMS ?? firstVelocity?.avgVelocityNorm
+  let lastAvg  = lastVelocity?.avgVelocityMS  ?? lastVelocity?.avgVelocityNorm
+
   let velocityLoss = null
-  if (
-    firstVelocity &&
-    lastVelocity &&
-    firstVelocity.avgVelocityNorm > 0 &&
-    lastVelocity.avgVelocityNorm > 0
-  ) {
-    velocityLoss =
-      ((firstVelocity.avgVelocityNorm - lastVelocity.avgVelocityNorm) /
-        firstVelocity.avgVelocityNorm) * 100
+  if (firstAvg > 0 && lastAvg > 0) {
+    velocityLoss = ((firstAvg - lastAvg) / firstAvg) * 100
   }
 
   return (
     <div style={styles.overlay}>
       <div style={styles.card}>
 
-        {/* Header */}
         <p style={styles.title}>SET COMPLETE</p>
         <p style={styles.subtitle}>
           {goodReps} / {totalReps} good {totalReps === 1 ? 'lift' : 'lifts'}
@@ -62,7 +76,6 @@ function ResultsOverlay({ repResults, totalReps, onDismiss }) {
 
         <div style={styles.divider} />
 
-        {/* Rep list */}
         <div style={styles.repList}>
           {repResults.map((rep) => {
             const velocity = formatVelocity(rep.velocity)
@@ -94,13 +107,20 @@ function ResultsOverlay({ repResults, totalReps, onDismiss }) {
                   <div style={styles.velocityBox}>
                     <p style={styles.velocityLine}>
                       Avg concentric: <strong>{velocity.avg}</strong> {velocity.unit}
+                      {velocity.estimated ? ' estimated' : ''}
                     </p>
                     <p style={styles.velocityLine}>
                       Peak concentric: <strong>{velocity.peak}</strong> {velocity.unit}
+                      {velocity.estimated ? ' estimated' : ''}
                     </p>
                     <p style={styles.velocityLine}>
                       Time: <strong>{velocity.time}</strong>s
                     </p>
+                    {velocity.estimated && velocity.segment && (
+                      <p style={styles.velocitySmall}>
+                        Scale from height estimate using {velocity.segment}.
+                      </p>
+                    )}
                   </div>
                 )}
 
@@ -112,10 +132,9 @@ function ResultsOverlay({ repResults, totalReps, onDismiss }) {
         <div style={styles.divider} />
 
         <p style={styles.velocityNote}>
-          Velocity is currently shown in relative screen units. Later this can be converted to m/s with plate calibration.
+          Enter height in Velocity Setup to show estimated m/s. Without height, velocity uses relative screen units.
         </p>
 
-        {/* Done button */}
         <button onClick={onDismiss} style={styles.doneButton}>
           Done
         </button>
@@ -229,6 +248,11 @@ const styles = {
     fontSize: '12px',
     color:    '#bbb',
     margin:   '2px 0',
+  },
+  velocitySmall: {
+    fontSize: '11px',
+    color:    '#666',
+    margin:   '4px 0 0',
   },
   velocityNote: {
     fontSize:   '11px',
