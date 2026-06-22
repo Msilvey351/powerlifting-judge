@@ -104,6 +104,7 @@ function CameraScreen() {
           if (update.result !== LiftResult.PENDING) {
             setResult(prev => {
               if (prev === LiftResult.PENDING) {
+                console.log('FINAL REP RESULTS:', update.repResults)
                 repResultsRef.current = update.repResults
                 setRepResults(update.repResults)
               }
