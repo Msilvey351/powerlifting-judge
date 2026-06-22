@@ -1,7 +1,48 @@
 import { LiftResult } from '../logic/stateMachine'
 
+function formatVelocity(velocity) {
+  if (!velocity) return null
+
+  const avg  = velocity.avgVelocityNorm
+  const peak = velocity.peakVelocityNorm
+  const time = velocity.durationSec
+
+  if (
+    avg == null ||
+    peak == null ||
+    time == null ||
+    Number.isNaN(avg) ||
+    Number.isNaN(peak) ||
+    Number.isNaN(time)
+  ) {
+    return null
+  }
+
+  return {
+    avg:  avg.toFixed(3),
+    peak: peak.toFixed(3),
+    time: time.toFixed(2),
+    unit: velocity.unit ?? 'norm/s',
+  }
+}
+
 function ResultsOverlay({ repResults, totalReps, onDismiss }) {
   const goodReps = repResults.filter(r => r.result === LiftResult.WHITE).length
+
+  const firstVelocity = repResults.find(r => r.velocity)?.velocity
+  const lastVelocity  = [...repResults].reverse().find(r => r.velocity)?.velocity
+
+  let velocityLoss = null
+  if (
+    firstVelocity &&
+    lastVelocity &&
+    firstVelocity.avgVelocityNorm > 0 &&
+    lastVelocity.avgVelocityNorm > 0
+  ) {
+    velocityLoss =
+      ((firstVelocity.avgVelocityNorm - lastVelocity.avgVelocityNorm) /
+        firstVelocity.avgVelocityNorm) * 100
+  }
 
   return (
     <div style={styles.overlay}>
@@ -13,35 +54,66 @@ function ResultsOverlay({ repResults, totalReps, onDismiss }) {
           {goodReps} / {totalReps} good {totalReps === 1 ? 'lift' : 'lifts'}
         </p>
 
+        {velocityLoss !== null && !Number.isNaN(velocityLoss) && (
+          <p style={styles.velocityLoss}>
+            Velocity loss: {velocityLoss.toFixed(1)}%
+          </p>
+        )}
+
         <div style={styles.divider} />
 
         {/* Rep list */}
         <div style={styles.repList}>
-          {repResults.map((rep) => (
-            <div key={rep.rep} style={styles.repRow}>
+          {repResults.map((rep) => {
+            const velocity = formatVelocity(rep.velocity)
 
-              <div style={styles.repLeft}>
-                <span style={styles.repLabel}>Rep {rep.rep}</span>
-                {rep.result === LiftResult.RED && rep.faults.length > 0 && (
-                  <span style={styles.faultText}>
-                    {rep.faults.join(', ')}
-                  </span>
+            return (
+              <div key={rep.rep} style={styles.repRowWrapper}>
+
+                <div style={styles.repRow}>
+                  <div style={styles.repLeft}>
+                    <span style={styles.repLabel}>Rep {rep.rep}</span>
+
+                    {rep.result === LiftResult.RED && rep.faults.length > 0 && (
+                      <span style={styles.faultText}>
+                        {rep.faults.join(', ')}
+                      </span>
+                    )}
+                  </div>
+
+                  <div style={{
+                    ...styles.light,
+                    background: rep.result === LiftResult.WHITE ? '#ffffff' : '#cc0000',
+                    boxShadow: rep.result === LiftResult.WHITE
+                      ? '0 0 12px rgba(255,255,255,0.5)'
+                      : '0 0 12px rgba(204,0,0,0.5)',
+                  }} />
+                </div>
+
+                {velocity && (
+                  <div style={styles.velocityBox}>
+                    <p style={styles.velocityLine}>
+                      Avg concentric: <strong>{velocity.avg}</strong> {velocity.unit}
+                    </p>
+                    <p style={styles.velocityLine}>
+                      Peak concentric: <strong>{velocity.peak}</strong> {velocity.unit}
+                    </p>
+                    <p style={styles.velocityLine}>
+                      Time: <strong>{velocity.time}</strong>s
+                    </p>
+                  </div>
                 )}
+
               </div>
-
-              <div style={{
-                ...styles.light,
-                background: rep.result === LiftResult.WHITE ? '#ffffff' : '#cc0000',
-                boxShadow: rep.result === LiftResult.WHITE
-                  ? '0 0 12px rgba(255,255,255,0.5)'
-                  : '0 0 12px rgba(204,0,0,0.5)',
-              }} />
-
-            </div>
-          ))}
+            )
+          })}
         </div>
 
         <div style={styles.divider} />
+
+        <p style={styles.velocityNote}>
+          Velocity is currently shown in relative screen units. Later this can be converted to m/s with plate calibration.
+        </p>
 
         {/* Done button */}
         <button onClick={onDismiss} style={styles.doneButton}>
@@ -72,7 +144,7 @@ const styles = {
     border:        '2px solid #333',
     padding:       '28px 32px',
     minWidth:      '280px',
-    maxWidth:      '340px',
+    maxWidth:      '380px',
     width:         '85%',
     display:       'flex',
     flexDirection: 'column',
@@ -93,6 +165,12 @@ const styles = {
     color:    '#aaa',
     margin:   0,
   },
+  velocityLoss: {
+    fontSize:   '13px',
+    color:      '#8bc34a',
+    margin:     0,
+    fontWeight: '600',
+  },
   divider: {
     width:      '100%',
     height:     '1px',
@@ -103,7 +181,13 @@ const styles = {
     width:         '100%',
     display:       'flex',
     flexDirection: 'column',
-    gap:           '10px',
+    gap:           '12px',
+  },
+  repRowWrapper: {
+    width:         '100%',
+    display:       'flex',
+    flexDirection: 'column',
+    gap:           '6px',
   },
   repRow: {
     display:        'flex',
@@ -132,6 +216,26 @@ const styles = {
     borderRadius: '50%',
     flexShrink:   0,
     marginLeft:   '12px',
+  },
+  velocityBox: {
+    width:        '100%',
+    boxSizing:    'border-box',
+    background:   '#111',
+    border:       '1px solid #2a2a2a',
+    borderRadius: '8px',
+    padding:      '8px 10px',
+  },
+  velocityLine: {
+    fontSize: '12px',
+    color:    '#bbb',
+    margin:   '2px 0',
+  },
+  velocityNote: {
+    fontSize:   '11px',
+    color:      '#666',
+    textAlign:  'center',
+    lineHeight: '1.4',
+    margin:     0,
   },
   doneButton: {
     width:        '100%',

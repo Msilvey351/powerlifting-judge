@@ -4,6 +4,9 @@ import { computeAngles, checkDepth, pickBestSide,
          benchPickBestSide, computeElbowAngle,
          getBenchSideLandmarkKeys } from './poseUtils.js'
 
+
+import { ConcentricVelocityTracker } from './velocityTracker.js'
+
 // ── Enums ─────────────────────────────────────────────────────────────────────
 export const SquatState = {
   WAITING:        'WAITING',
@@ -423,6 +426,19 @@ export class DeadliftReferee {
     this._reset()
   }
 
+  _getDeadliftVelocityY(landmarks, side) {
+    if (this.angle === 'side') {
+      return landmarks[`${side}_wrist`]?.y ?? null
+    }
+
+    // Front view: average both wrists
+    const left  = landmarks.left_wrist
+    const right = landmarks.right_wrist
+    if (!left || !right) return null
+
+    return (left.y + right.y) / 2
+  }
+
   _reset() {
     this.state              = DeadliftState.WAITING
     this.result             = LiftResult.PENDING
@@ -434,6 +450,7 @@ export class DeadliftReferee {
     this._hipAngleHistory   = []
     this._handDistHistory   = []
     this._confirmedHinge    = false
+    this._velocityTracker   = new ConcentricVelocityTracker()
     this._lastSide          = null
     this._detector          = new StillnessDetector(
       [], this.stillnessFrames, this.stillnessThreshold
@@ -476,9 +493,10 @@ export class DeadliftReferee {
       : LiftResult.RED
 
     this.repResults.push({
-      rep:    this.currentRep,
-      result: repResult,
-      faults: repResult === LiftResult.RED ? [...this._faults] : [],
+      rep:      this.currentRep,
+      result:   repResult,
+      faults:   repResult === LiftResult.RED ? [...this._faults] : [],
+      velocity: this._velocityTracker.getMetrics(),
     })
 
     console.log(`[REP ${this.currentRep}] ${repResult}`)
@@ -491,6 +509,7 @@ export class DeadliftReferee {
     this._hipAngleHistory = []
     this._handDistHistory = []
     this._confirmedHinge  = false
+    this._velocityTracker.reset()
   }
 
   _isHipLocked(landmarks, side, angles) {
@@ -604,6 +623,10 @@ export class DeadliftReferee {
       if (this._confirmedHinge && sustainedPull) {
         this._hipAngleHistory = []
         this._handDistHistory = []
+
+        const y = this._getDeadliftVelocityY(landmarks, side)
+        this._velocityTracker.start(y)
+
         this.currentRep++
         this.state = DeadliftState.PULLING
       }
@@ -613,6 +636,9 @@ export class DeadliftReferee {
       }
 
     } else if (this.state === DeadliftState.PULLING) {
+      const y = this._getDeadliftVelocityY(landmarks, side)
+      this._velocityTracker.add(y)
+
       if (kneeLocked && hipLocked) {
         this.state          = DeadliftState.LOCKOUT
         this._lockoutFrames = 0
@@ -720,6 +746,14 @@ export class BenchReferee {
     this._reset()
   }
 
+    _getBenchVelocityY(landmarks, side, barY = null) {
+    // Prefer actual detected bar position if available
+    if (barY != null && !Number.isNaN(barY)) return barY
+
+    // Fallback to wrist Y
+    return landmarks[`${side}_wrist`]?.y ?? null
+  }
+
   _reset() {
     this.state      = BenchState.WAITING
     this.result     = LiftResult.PENDING
@@ -740,6 +774,8 @@ export class BenchReferee {
     this._pressCommandFired   = false
     this._startCommandFired   = false
     this._chestReached        = false
+
+    this._velocityTracker = new ConcentricVelocityTracker()
   }
 
   reset() {
@@ -758,6 +794,8 @@ export class BenchReferee {
     this._pressCommandFired   = false
     this._startCommandFired   = false
     this._chestReached        = false
+
+    this._velocityTracker.reset()
 
     // Do NOT clear _lockedSide here.
     // Once selected at setup, the side remains locked for the whole set.
@@ -785,9 +823,10 @@ export class BenchReferee {
       : ['Bar did not reach chest', ...this._faults]
 
     this.repResults.push({
-      rep:    this.currentRep,
-      result: repResult,
-      faults: repResult === LiftResult.RED ? reasons : [],
+      rep:      this.currentRep,
+      result:   repResult,
+      faults:   repResult === LiftResult.RED ? reasons : [],
+      velocity: this._velocityTracker.getMetrics(),
     })
 
     console.log(
@@ -1013,11 +1052,16 @@ export class BenchReferee {
         }
 
       } else if (!atChest && !wristStill) {
+        const y = this._getBenchVelocityY(landmarks, side, barY)
+        this._velocityTracker.start(y)
         this.state = BenchState.PRESSING
       }
 
     // ── PRESSING ────────────────────────────────────────────────────────────
     } else if (this.state === BenchState.PRESSING) {
+      const y = this._getBenchVelocityY(landmarks, side, barY)
+      this._velocityTracker.add(y)
+      
       // If it drops back to chest, return to chest state.
       if (atChest) {
         this.state = BenchState.CHEST
