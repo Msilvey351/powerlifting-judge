@@ -2,7 +2,7 @@ import { computeAngles, checkDepth, pickBestSide,
          lateralityScore, classifyCamera,
          handFootDistance, euclideanDistance,
          benchPickBestSide, computeElbowAngle,
-         getBenchSideLandmarkKeys } from './poseUtils.js'
+         getBenchSideLandmarkKeys, areVisible } from './poseUtils.js'
 
 
 import { ConcentricVelocityTracker } from './velocityTracker.js'
@@ -101,6 +101,66 @@ class StillnessDetector {
     this._stillFrames = 0
   }
 }
+
+
+// ── Visibility policy helpers ────────────────────────────────────────────────
+
+function squatRequiredKeys(side) {
+  return [
+    `${side}_shoulder`,
+    `${side}_hip`,
+    `${side}_knee`,
+    `${side}_ankle`,
+  ]
+}
+
+function deadliftRequiredKeys(angle, side) {
+  if (angle === 'front') {
+    return [
+      'left_wrist',
+      'right_wrist',
+      'left_knee',
+      'right_knee',
+      'left_ankle',
+      'right_ankle',
+    ]
+  }
+
+  return [
+    `${side}_shoulder`,
+    `${side}_hip`,
+    `${side}_knee`,
+    `${side}_ankle`,
+    `${side}_wrist`,
+  ]
+}
+
+function benchRequiredKeys(angle, side) {
+  if (angle === 'front') {
+    return [
+      'left_shoulder',
+      'left_elbow',
+      'left_wrist',
+      'right_shoulder',
+      'right_elbow',
+      'right_wrist',
+    ]
+  }
+
+  return [
+    `${side}_shoulder`,
+    `${side}_elbow`,
+    `${side}_wrist`,
+  ]
+}
+
+function visibilityCheck(label, visible) {
+  return {
+    label,
+    passed: visible,
+  }
+}
+
 
 
 // ── SquatReferee ──────────────────────────────────────────────────────────────
@@ -217,6 +277,29 @@ export class SquatReferee {
 
     const score       = lateralityScore(landmarks)
     const camera      = classifyCamera(score)
+
+    const requiredKeys = squatRequiredKeys(side)
+    const jointsVisible = areVisible(landmarks, requiredKeys)
+
+    if (!jointsVisible) {
+      return {
+        state:      this.state,
+        result:     this.result,
+        progress:   0,
+        isStill:    false,
+        checks: [
+          visibilityCheck('Required joints visible', false),
+        ],
+        currentRep: this.currentRep,
+        totalReps:  this.totalReps,
+        repResults: this.repResults,
+        side,
+        camera,
+      }
+    }
+
+
+
     const angles      = computeAngles(landmarks, side)
     const { atDepth } = checkDepth(landmarks, side, camera)
     const { isStill, progress } = this._updateDetector(landmarks, side)
@@ -320,6 +403,7 @@ export class SquatReferee {
     }
 
     const checks = [
+      { label: 'Joints visible', passed: jointsVisible     },
       { label: 'Hips upright', passed: hipUpright          },
       { label: 'Knees locked', passed: kneeLocked          },
       { label: 'Still',        passed: isStill             },
@@ -537,6 +621,28 @@ export class DeadliftReferee {
 
     const score    = lateralityScore(landmarks)
     const camera   = classifyCamera(score)
+
+    const requiredKeys = deadliftRequiredKeys(this.angle, side)
+    const jointsVisible = areVisible(landmarks, requiredKeys)
+
+    if (!jointsVisible) {
+      return {
+        state:      this.state,
+        result:     this.result,
+        progress:   0,
+        isStill:    false,
+        checks: [
+          visibilityCheck('Required joints visible', false),
+        ],
+        currentRep: this.currentRep,
+        totalReps:  this.totalReps,
+        repResults: this.repResults,
+        side,
+        camera,
+      }
+    }
+
+
     const angles   = computeAngles(landmarks, side)
     const { isStill, progress } = this._updateDetector(landmarks, side)
     this._latestMetresPerNormUnit = estimateMetresPerNormUnit(
@@ -668,12 +774,14 @@ export class DeadliftReferee {
 
     const checks = this.angle === 'side'
       ? [
+          { label: 'Joints visible', passed: jointsVisible},
           { label: 'Knees locked',   passed: kneeLocked    },
           { label: 'Hips through',   passed: hipLocked      },
           { label: 'Shoulders back', passed: shouldersBack  },
           { label: 'Still',          passed: isStill        },
         ]
       : [
+          {label: 'Joints visible', passed: jointsVisible },
           { label: 'Knees locked',   passed: kneeLocked    },
           { label: 'Still',          passed: isStill        },
         ]
@@ -916,6 +1024,34 @@ export class BenchReferee {
     const side = this._getSide(landmarks)
     if (!side) return this._emptyReturn()
 
+    const requiredKeys = benchRequiredKeys(this.angle, side)
+    const jointsVisible = areVisible(landmarks, requiredKeys)
+
+    if (!jointsVisible) {
+      return {
+        ...this._emptyReturn(),
+        side,
+        lockedSide: this._lockedSide,
+        trackedLandmarkKeys: this._trackedLandmarkKeys,
+        checks: [
+          visibilityCheck('Required joints visible', false),
+        ],
+      }
+    }
+
+    const elbowAngle = computeElbowAngle(landmarks, side)
+    if (elbowAngle === null) {
+      return {
+        ...this._emptyReturn(),
+        side,
+        lockedSide: this._lockedSide,
+        trackedLandmarkKeys: this._trackedLandmarkKeys,
+        checks: [
+          visibilityCheck('Required joints visible', false),
+        ],
+      }
+    }
+
     const elbowAngle = computeElbowAngle(landmarks, side)
     if (elbowAngle === null) return this._emptyReturn()
 
@@ -1113,6 +1249,7 @@ export class BenchReferee {
       result:     this.result,
       progress,
       checks: [
+        {label: 'Arm joints visible', passed: true },
         { label: 'Arms locked',  passed: lockedOut                 },
         { label: 'Wrist still',  passed: wristStill                },
         { label: 'Bar at chest', passed: atChest                   },

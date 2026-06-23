@@ -189,12 +189,19 @@ export function benchPickBestSide(landmarks, minVisibility = 0.5) {
  * 180° = locked out.
  * Lower value = arm more bent.
  */
-export function computeElbowAngle(landmarks, side) {
+export function computeElbowAngle(landmarks, side, minVisibility = 0.5) {
   const shoulder = landmarks[`${side}_shoulder`]
   const elbow    = landmarks[`${side}_elbow`]
   const wrist    = landmarks[`${side}_wrist`]
 
-  if (!shoulder || !elbow || !wrist) return null
+  if (
+    !isVisible(shoulder, minVisibility) ||
+    !isVisible(elbow, minVisibility) ||
+    !isVisible(wrist, minVisibility)
+  ) {
+    return null
+  }
+
   return angleBetween(shoulder, elbow, wrist)
 }
 
@@ -219,10 +226,20 @@ export function getBenchSideLandmarkKeys(side) {
   ]
 }
 
+// ── Visibility helpers ───────────────────────────────────────────────────────
+
 export function isVisible(lm, threshold = 0.5) {
   return !!lm && (lm.visibility ?? 1) >= threshold
 }
 
 export function areVisible(landmarks, keys, threshold = 0.5) {
   return keys.every(key => isVisible(landmarks[key], threshold))
+}
+
+export function visibleKeys(landmarks, keys, threshold = 0.5) {
+  return keys.filter(key => isVisible(landmarks[key], threshold))
+}
+
+export function missingKeys(landmarks, keys, threshold = 0.5) {
+  return keys.filter(key => !isVisible(landmarks[key], threshold))
 }
