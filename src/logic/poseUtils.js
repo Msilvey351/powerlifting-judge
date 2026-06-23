@@ -15,7 +15,6 @@ export const LANDMARK_INDICES = {
   left_ankle:       27,
   right_ankle:      28,
 
-  // Foot landmarks — useful for bench foot/leg tracking later
   left_heel:        29,
   right_heel:       30,
   left_foot_index:  31,
@@ -218,4 +217,12 @@ export function getBenchSideLandmarkKeys(side) {
     `${side}_heel`,
     `${side}_foot_index`,
   ]
+}
+
+export function isVisible(lm, threshold = 0.5) {
+  return !!lm && (lm.visibility ?? 1) >= threshold
+}
+
+export function areVisible(landmarks, keys, threshold = 0.5) {
+  return keys.every(key => isVisible(landmarks[key], threshold))
 }

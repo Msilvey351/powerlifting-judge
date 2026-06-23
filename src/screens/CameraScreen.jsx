@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate, useParams }                   from 'react-router-dom'
 import { PoseLandmarker, FilesetResolver, DrawingUtils } from '@mediapipe/tasks-vision'
 import { initAudio, speakCommand }   from '../logic/audio'
-import { extractLandmarks }          from '../logic/poseUtils'
+import { extractLandmarks, isVisible } from '../logic/poseUtils'
+import { drawRelevantVisiblePose }   from '../logic/drawingPolicy'
 import { BarDetector }               from '../logic/barDetector'
 import { getCalibration }            from '../logic/calibrationStore'
 import { getUserProfile }            from '../logic/userProfileStore'
@@ -48,12 +49,30 @@ function CameraScreen() {
     speakCommand(command)
   }, [])
 
+  function getVisibleWristYForBarRoi(landmarks) {
+    const left  = landmarks.left_wrist
+    const right = landmarks.right_wrist
+
+    const leftVisible  = isVisible(left, 0.5)
+    const rightVisible = isVisible(right, 0.5)
+
+    if (leftVisible && rightVisible) {
+      return (left.y + right.y) / 2
+    }
+
+    if (leftVisible) return left.y
+    if (rightVisible) return right.y
+
+    return null
+  }
+
   // ── Detection loop ──────────────────────────────────────────────────────────
   const startDetectionLoop = useCallback(() => {
     const video          = videoRef.current
     const canvas         = canvasRef.current
     const poseLandmarker = poseLandmarkerRef.current
     const referee        = refereeRef.current
+
     if (!video || !canvas || !poseLandmarker || !referee) return
 
     const ctx          = canvas.getContext('2d')
@@ -69,28 +88,34 @@ function CameraScreen() {
 
         if (results.landmarks && results.landmarks.length > 0) {
           const rawLandmarks = results.landmarks[0]
+          const landmarks    = extractLandmarks(rawLandmarks)
 
-          drawingUtils.drawConnectors(
-            rawLandmarks,
-            PoseLandmarker.POSE_CONNECTIONS,
-            { color: '#00FF00', lineWidth: 2 }
-          )
-          drawingUtils.drawLandmarks(
-            rawLandmarks,
-            { color: '#FF0000', lineWidth: 1, radius: 3 }
-          )
-
-          const landmarks = extractLandmarks(rawLandmarks)
-
+          // Bar detection for bench.
+          // Only use visible wrist(s) for ROI. If no wrists are visible, bar detector
+          // can still keep previous tracking internally, but we do not seed it with
+          // hallucinated wrist positions.
           let barY = null
           if (isBench && barDetectorRef.current) {
-            const wristY = landmarks.left_wrist?.y ?? landmarks.right_wrist?.y ?? null
+            const wristY = getVisibleWristYForBarRoi(landmarks)
             barY = barDetectorRef.current.processFrame(video, wristY)
           }
 
+          // State machine update first, so drawing can use update.side / update.lockedSide.
           const update = isBench
             ? referee.update(landmarks, barY)
             : referee.update(landmarks)
+
+          // Draw only relevant and currently visible landmarks/connectors.
+          drawRelevantVisiblePose({
+            drawingUtils,
+            rawLandmarks,
+            liftId,
+            angle,
+            update,
+            landmarkStyle:  { color: '#FF0000', lineWidth: 1, radius: 3 },
+            connectorStyle: { color: '#00FF00', lineWidth: 2 },
+            visibilityThreshold: 0.5,
+          })
 
           if (update.currentRep > 0) {
             setStatus(
@@ -107,6 +132,7 @@ function CameraScreen() {
                 repResultsRef.current = update.repResults
                 setRepResults(update.repResults)
               }
+
               return update.result
             })
           } else {
@@ -122,7 +148,7 @@ function CameraScreen() {
     }
 
     detect()
-  }, [totalReps, stateMessages, isBench])
+  }, [totalReps, stateMessages, isBench, liftId, angle])
 
   // ── Start camera ────────────────────────────────────────────────────────────
   const startCamera = useCallback(async () => {
@@ -131,24 +157,30 @@ function CameraScreen() {
       { video: { facingMode: 'environment' } },
       { video: true },
     ]
+
     let lastError = null
+
     for (const constraints of attempts) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia(constraints)
         const video  = videoRef.current
+
         if (video) {
           video.srcObject = stream
           video.play().catch(() => {})
+
           video.onloadedmetadata = () => {
             setStatus('READY — Get into position')
             startDetectionLoop()
           }
         }
+
         return
       } catch (err) {
         lastError = err
       }
     }
+
     setCameraError(lastError.name + ': ' + lastError.message)
   }, [startDetectionLoop])
 
@@ -174,6 +206,7 @@ function CameraScreen() {
         const vision = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
         )
+
         poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
@@ -183,6 +216,7 @@ function CameraScreen() {
           numPoses: 1
         })
         // ─────────────────────────────────────────────────────────────────
+
         await startCamera()
       } catch (err) {
         setCameraError('Failed to load: ' + err.message)
@@ -198,6 +232,7 @@ function CameraScreen() {
     }
   }, [handleCommand, startCamera, totalReps, isBench, isDeadlift, angle])
 
+  // ── Handlers ────────────────────────────────────────────────────────────────
   const handleBack = () => navigate('/')
 
   const handleDismiss = () => {
@@ -208,10 +243,14 @@ function CameraScreen() {
     navigate('/')
   }
 
+  // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div style={styles.container}>
       <div style={styles.topBar}>
-        <button onClick={handleBack} style={styles.backButton}>← Back</button>
+        <button onClick={handleBack} style={styles.backButton}>
+          ← Back
+        </button>
+
         <span style={styles.liftInfo}>
           {formatParam(liftId)} | {formatParam(angle)} | {totalReps} {totalReps === 1 ? 'rep' : 'reps'}
         </span>
@@ -224,6 +263,7 @@ function CameraScreen() {
           <>
             <video ref={videoRef} autoPlay playsInline muted style={styles.video} />
             <canvas ref={canvasRef} style={styles.canvas} />
+
             {result !== LiftResult.PENDING && (
               <ResultsOverlay
                 repResults={repResults}
@@ -241,14 +281,56 @@ function CameraScreen() {
 }
 
 const styles = {
-  container:  { display: 'flex', flexDirection: 'column', height: '100vh', background: '#000' },
-  topBar:     { display: 'flex', alignItems: 'center', padding: '12px 16px', background: '#111', gap: '16px', flexShrink: 0 },
-  backButton: { fontSize: '16px', color: '#888' },
-  liftInfo:   { fontSize: '14px', fontWeight: '500', color: '#fff' },
-  cameraArea: { flex: 1, position: 'relative', background: '#000', overflow: 'hidden' },
-  video:      { position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', objectFit: 'cover' },
-  canvas:     { position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' },
-  errorText:  { color: 'red', fontSize: '14px', padding: '16px', textAlign: 'center' },
+  container: {
+    display:       'flex',
+    flexDirection: 'column',
+    height:        '100vh',
+    background:    '#000',
+  },
+  topBar: {
+    display:    'flex',
+    alignItems: 'center',
+    padding:    '12px 16px',
+    background: '#111',
+    gap:        '16px',
+    flexShrink: 0,
+  },
+  backButton: {
+    fontSize: '16px',
+    color:    '#888',
+  },
+  liftInfo: {
+    fontSize:   '14px',
+    fontWeight: '500',
+    color:      '#fff',
+  },
+  cameraArea: {
+    flex:       1,
+    position:   'relative',
+    background: '#000',
+    overflow:   'hidden',
+  },
+  video: {
+    position:  'absolute',
+    top:       0,
+    left:      0,
+    width:     '100%',
+    height:    '100%',
+    objectFit: 'cover',
+  },
+  canvas: {
+    position: 'absolute',
+    top:      0,
+    left:     0,
+    width:    '100%',
+    height:   '100%',
+  },
+  errorText: {
+    color:     'red',
+    fontSize:  '14px',
+    padding:   '16px',
+    textAlign: 'center',
+  },
 }
 
 export default CameraScreen
