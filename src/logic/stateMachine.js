@@ -1040,6 +1040,7 @@ export class BenchReferee {
     }
 
     const elbowAngle = computeElbowAngle(landmarks, side)
+
     if (elbowAngle === null) {
       return {
         ...this._emptyReturn(),
@@ -1051,9 +1052,6 @@ export class BenchReferee {
         ],
       }
     }
-
-    const elbowAngle = computeElbowAngle(landmarks, side)
-    if (elbowAngle === null) return this._emptyReturn()
 
     const wristVelocity = this._updateWristHistory(landmarks, side)
     const wristStill    = wristVelocity < this.VELOCITY_THRESHOLD
