@@ -36,7 +36,7 @@ function CameraScreen() {
   const [cameraError, setCameraError] = useState(null)
   const [result,      setResult]      = useState(LiftResult.PENDING)
   const [repResults,  setRepResults]  = useState([])
-  const [facingMode,  setFacingMode]  = useState('user') // user = front/selfie, environment = back
+  const [facingMode,  setFacingMode]  = useState('environment') // user = front/selfie, environment = back
 
   const totalReps     = parseInt(reps, 10)
   const isBench       = liftId === 'bench'
@@ -256,7 +256,7 @@ function CameraScreen() {
         })
         // ─────────────────────────────────────────────────────────────────
 
-        await startCamera('user')
+        await startCamera('environment')
       } catch (err) {
         setCameraError('Failed to load: ' + err.message)
       }
