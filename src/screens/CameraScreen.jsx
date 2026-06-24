@@ -30,11 +30,13 @@ function CameraScreen() {
   const refereeRef        = useRef(null)
   const barDetectorRef    = useRef(null)
   const repResultsRef     = useRef([])
+  const streamRef         = useRef(null)
 
   const [status,      setStatus]      = useState('Loading pose detection...')
   const [cameraError, setCameraError] = useState(null)
   const [result,      setResult]      = useState(LiftResult.PENDING)
   const [repResults,  setRepResults]  = useState([])
+  const [facingMode,  setFacingMode]  = useState('user') // user = front/selfie, environment = back
 
   const totalReps     = parseInt(reps, 10)
   const isBench       = liftId === 'bench'
@@ -65,6 +67,13 @@ function CameraScreen() {
 
     return null
   }
+
+  const stopCurrentStream = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop())
+      streamRef.current = null
+    }
+  }, [])
 
   // ── Detection loop ──────────────────────────────────────────────────────────
   const startDetectionLoop = useCallback(() => {
@@ -151,10 +160,28 @@ function CameraScreen() {
   }, [totalReps, stateMessages, isBench, liftId, angle])
 
   // ── Start camera ────────────────────────────────────────────────────────────
-  const startCamera = useCallback(async () => {
+  const startCamera = useCallback(async (preferredFacingMode = 'user') => {
+    // Stop old stream before starting a new one
+    stopCurrentStream()
+
+    // Prevent duplicate detection loops after switching cameras
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current)
+      animationFrameRef.current = null
+    }
+
+    setCameraError(null)
+
     const attempts = [
-      { video: { facingMode: 'user' } },
-      { video: { facingMode: 'environment' } },
+      { video: { facingMode: { exact: preferredFacingMode } } },
+      { video: { facingMode: preferredFacingMode } },
+      {
+        video: {
+          facingMode: preferredFacingMode === 'user'
+            ? 'environment'
+            : 'user'
+        }
+      },
       { video: true },
     ]
 
@@ -163,10 +190,22 @@ function CameraScreen() {
     for (const constraints of attempts) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia(constraints)
-        const video  = videoRef.current
+        streamRef.current = stream
+
+        const video = videoRef.current
 
         if (video) {
           video.srcObject = stream
+
+          const actualFacingMode =
+            stream.getVideoTracks()[0]?.getSettings?.().facingMode
+
+          if (actualFacingMode === 'user' || actualFacingMode === 'environment') {
+            setFacingMode(actualFacingMode)
+          } else {
+            setFacingMode(preferredFacingMode)
+          }
+
           video.play().catch(() => {})
 
           video.onloadedmetadata = () => {
@@ -181,8 +220,8 @@ function CameraScreen() {
       }
     }
 
-    setCameraError(lastError.name + ': ' + lastError.message)
-  }, [startDetectionLoop])
+    setCameraError(lastError?.name + ': ' + lastError?.message)
+  }, [startDetectionLoop, stopCurrentStream])
 
   // ── Load everything ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -217,7 +256,7 @@ function CameraScreen() {
         })
         // ─────────────────────────────────────────────────────────────────
 
-        await startCamera()
+        await startCamera('user')
       } catch (err) {
         setCameraError('Failed to load: ' + err.message)
       }
@@ -229,11 +268,17 @@ function CameraScreen() {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current)
       if (poseLandmarkerRef.current)  poseLandmarkerRef.current.close()
       if (barDetectorRef.current)     barDetectorRef.current.dispose()
+      stopCurrentStream()
     }
-  }, [handleCommand, startCamera, totalReps, isBench, isDeadlift, angle])
+  }, [handleCommand, startCamera, totalReps, isBench, isDeadlift, angle, stopCurrentStream])
 
   // ── Handlers ────────────────────────────────────────────────────────────────
   const handleBack = () => navigate('/')
+
+  const handleSwitchCamera = async () => {
+    const nextFacingMode = facingMode === 'user' ? 'environment' : 'user'
+    await startCamera(nextFacingMode)
+  }
 
   const handleDismiss = () => {
     setResult(LiftResult.PENDING)
@@ -254,6 +299,10 @@ function CameraScreen() {
         <span style={styles.liftInfo}>
           {formatParam(liftId)} | {formatParam(angle)} | {totalReps} {totalReps === 1 ? 'rep' : 'reps'}
         </span>
+
+        <button onClick={handleSwitchCamera} style={styles.switchCameraButton}>
+          {facingMode === 'user' ? 'Back Camera' : 'Front Camera'}
+        </button>
       </div>
 
       <div style={styles.cameraArea}>
@@ -292,7 +341,7 @@ const styles = {
     alignItems: 'center',
     padding:    '12px 16px',
     background: '#111',
-    gap:        '16px',
+    gap:        '12px',
     flexShrink: 0,
   },
   backButton: {
@@ -303,6 +352,18 @@ const styles = {
     fontSize:   '14px',
     fontWeight: '500',
     color:      '#fff',
+    flex:       1,
+    minWidth:   0,
+  },
+  switchCameraButton: {
+    fontSize:     '13px',
+    color:        '#fff',
+    background:   '#222',
+    border:       '1px solid #444',
+    borderRadius: '8px',
+    padding:      '8px 10px',
+    cursor:       'pointer',
+    whiteSpace:   'nowrap',
   },
   cameraArea: {
     flex:       1,
