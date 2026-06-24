@@ -5,6 +5,7 @@ import { initAudio, speakCommand }   from '../logic/audio'
 import { extractLandmarks, isVisible } from '../logic/poseUtils'
 import { drawRelevantVisiblePose }   from '../logic/drawingPolicy'
 import { BarDetector }               from '../logic/barDetector'
+import { SetRecorder }               from '../logic/setRecorder'
 import { getCalibration }            from '../logic/calibrationStore'
 import { getUserProfile }            from '../logic/userProfileStore'
 import {
@@ -32,11 +33,21 @@ function CameraScreen() {
   const repResultsRef     = useRef([])
   const streamRef         = useRef(null)
 
+  // Recording refs
+  const setRecorderRef       = useRef(null)
+  const recordingFinalizedRef = useRef(false)
+
   const [status,      setStatus]      = useState('Loading pose detection...')
   const [cameraError, setCameraError] = useState(null)
   const [result,      setResult]      = useState(LiftResult.PENDING)
   const [repResults,  setRepResults]  = useState([])
-  const [facingMode,  setFacingMode]  = useState('environment') // user = front/selfie, environment = back
+  const [facingMode,  setFacingMode]  = useState('user')
+
+  const [recordEnabled, setRecordEnabled] = useState(false)
+  const [recordingState, setRecordingState] = useState('idle') // idle | recording | finalizing | ready | error
+  const [recordingUrl, setRecordingUrl] = useState(null)
+  const [recordingFilename, setRecordingFilename] = useState('set-recording.webm')
+  const [recordingError, setRecordingError] = useState(null)
 
   const totalReps     = parseInt(reps, 10)
   const isBench       = liftId === 'bench'
@@ -75,6 +86,117 @@ function CameraScreen() {
     }
   }, [])
 
+  const stopRecorder = useCallback(() => {
+    if (setRecorderRef.current?.isRecording()) {
+      setRecorderRef.current.stop()
+    }
+  }, [])
+
+  const startRecorder = useCallback(async () => {
+    const video = videoRef.current
+    if (!video) {
+      setRecordingError('Camera not ready')
+      setRecordingState('error')
+      return
+    }
+
+    if (!window.MediaRecorder) {
+      setRecordingError('Recording is not supported in this browser')
+      setRecordingState('error')
+      return
+    }
+
+    const width  = video.videoWidth  || 1280
+    const height = video.videoHeight || 720
+
+    if (recordingUrl) {
+      URL.revokeObjectURL(recordingUrl)
+      setRecordingUrl(null)
+    }
+
+    recordingFinalizedRef.current = false
+
+    const filename = `${liftId}-${angle}-${new Date().toISOString().replace(/[:.]/g, '-')}.webm`
+
+    const recorder = new SetRecorder({
+      fps: 30,
+      onStop: ({ url, filename: stoppedFilename }) => {
+        setRecordingUrl(url)
+        setRecordingFilename(stoppedFilename || filename)
+        setRecordingState('ready')
+        setRecordEnabled(false)
+      },
+      onError: (err) => {
+        console.warn('[CameraScreen] Recorder error:', err)
+        setRecordingError('Recording failed')
+        setRecordingState('error')
+        setRecordEnabled(false)
+      },
+    })
+
+    try {
+      await recorder.start({
+        width,
+        height,
+        includeAudio: true,
+        filename,
+      })
+
+      setRecorderRef.current = recorder
+      setRecordingState('recording')
+      setRecordingError(null)
+      setRecordEnabled(true)
+    } catch (err) {
+      console.warn('[CameraScreen] Could not start recorder:', err)
+      setRecordingError(err.message)
+      setRecordingState('error')
+      setRecordEnabled(false)
+    }
+  }, [angle, liftId, recordingUrl])
+
+  const finalizeRecording = useCallback(({
+    video,
+    rawLandmarks,
+    update,
+    statusText,
+    finalRepResults,
+  }) => {
+    const recorder = setRecorderRef.current
+    if (!recorder?.isRecording()) return
+    if (recordingFinalizedRef.current) return
+
+    recordingFinalizedRef.current = true
+    setRecordingState('finalizing')
+
+    const startTime = performance.now()
+    const durationMs = 4000
+
+    const drawSummaryLoop = () => {
+      if (!recorder.isRecording()) return
+
+      recorder.drawSummary({
+        video,
+        rawLandmarks,
+        liftId,
+        angle,
+        update,
+        statusText: statusText || 'SET COMPLETE',
+        repResults: finalRepResults,
+        totalReps,
+      })
+
+      const elapsed = performance.now() - startTime
+
+      if (elapsed < durationMs) {
+        requestAnimationFrame(drawSummaryLoop)
+      } else {
+        recorder.stop()
+      }
+    }
+
+    drawSummaryLoop()
+  }, [angle, liftId, totalReps])
+
   // ── Detection loop ──────────────────────────────────────────────────────────
   const startDetectionLoop = useCallback(() => {
     const video          = videoRef.current
@@ -99,22 +221,16 @@ function CameraScreen() {
           const rawLandmarks = results.landmarks[0]
           const landmarks    = extractLandmarks(rawLandmarks)
 
-          // Bar detection for bench.
-          // Only use visible wrist(s) for ROI. If no wrists are visible, bar detector
-          // can still keep previous tracking internally, but we do not seed it with
-          // hallucinated wrist positions.
           let barY = null
           if (isBench && barDetectorRef.current) {
             const wristY = getVisibleWristYForBarRoi(landmarks)
             barY = barDetectorRef.current.processFrame(video, wristY)
           }
 
-          // State machine update first, so drawing can use update.side / update.lockedSide.
           const update = isBench
             ? referee.update(landmarks, barY)
             : referee.update(landmarks)
 
-          // Draw only relevant and currently visible landmarks/connectors.
           drawRelevantVisiblePose({
             drawingUtils,
             rawLandmarks,
@@ -126,20 +242,48 @@ function CameraScreen() {
             visibilityThreshold: 0.5,
           })
 
+          let statusText
           if (update.currentRep > 0) {
-            setStatus(
-              `Rep ${update.currentRep}/${totalReps} — ${stateMessages[update.state] ?? update.state}`
-            )
+            statusText = `Rep ${update.currentRep}/${totalReps} — ${stateMessages[update.state] ?? update.state}`
           } else {
-            setStatus(stateMessages[update.state] ?? update.state)
+            statusText = stateMessages[update.state] ?? update.state
+          }
+
+          setStatus(statusText)
+
+          // Draw live frame into recording
+          if (
+            recordEnabled &&
+            setRecorderRef.current?.isRecording() &&
+            !recordingFinalizedRef.current
+          ) {
+            setRecorderRef.current.drawFrame({
+              video,
+              rawLandmarks,
+              liftId,
+              angle,
+              update,
+              statusText,
+            })
           }
 
           if (update.result !== LiftResult.PENDING) {
             setResult(prev => {
               if (prev === LiftResult.PENDING) {
                 console.log('FINAL REP RESULTS:', update.repResults)
+
                 repResultsRef.current = update.repResults
                 setRepResults(update.repResults)
+
+                if (setRecorderRef.current?.isRecording()) {
+                  finalizeRecording({
+                    video,
+                    rawLandmarks,
+                    update,
+                    statusText: 'SET COMPLETE',
+                    finalRepResults: update.repResults,
+                  })
+                }
               }
 
               return update.result
@@ -157,14 +301,20 @@ function CameraScreen() {
     }
 
     detect()
-  }, [totalReps, stateMessages, isBench, liftId, angle])
+  }, [
+    totalReps,
+    stateMessages,
+    isBench,
+    liftId,
+    angle,
+    recordEnabled,
+    finalizeRecording,
+  ])
 
   // ── Start camera ────────────────────────────────────────────────────────────
   const startCamera = useCallback(async (preferredFacingMode = 'user') => {
-    // Stop old stream before starting a new one
     stopCurrentStream()
 
-    // Prevent duplicate detection loops after switching cameras
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current)
       animationFrameRef.current = null
@@ -241,7 +391,6 @@ function CameraScreen() {
       }
 
       try {
-        // ── MediaPipe loading — do not modify ─────────────────────────────
         const vision = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
         )
@@ -254,9 +403,8 @@ function CameraScreen() {
           runningMode: 'VIDEO',
           numPoses: 1
         })
-        // ─────────────────────────────────────────────────────────────────
 
-        await startCamera('environment')
+        await startCamera(facingMode)
       } catch (err) {
         setCameraError('Failed to load: ' + err.message)
       }
@@ -268,9 +416,13 @@ function CameraScreen() {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current)
       if (poseLandmarkerRef.current)  poseLandmarkerRef.current.close()
       if (barDetectorRef.current)     barDetectorRef.current.dispose()
+      stopRecorder()
+      setRecorderRef.current?.dispose()
       stopCurrentStream()
     }
-  }, [handleCommand, startCamera, totalReps, isBench, isDeadlift, angle, stopCurrentStream])
+    // Do not include facingMode here. Camera switching is handled manually.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handleCommand, startCamera, totalReps, isBench, isDeadlift, angle, stopCurrentStream, stopRecorder])
 
   // ── Handlers ────────────────────────────────────────────────────────────────
   const handleBack = () => navigate('/')
@@ -278,6 +430,15 @@ function CameraScreen() {
   const handleSwitchCamera = async () => {
     const nextFacingMode = facingMode === 'user' ? 'environment' : 'user'
     await startCamera(nextFacingMode)
+  }
+
+  const handleToggleRecording = async () => {
+    if (setRecorderRef.current?.isRecording()) {
+      stopRecorder()
+      return
+    }
+
+    await startRecorder()
   }
 
   const handleDismiss = () => {
@@ -300,10 +461,40 @@ function CameraScreen() {
           {formatParam(liftId)} | {formatParam(angle)} | {totalReps} {totalReps === 1 ? 'rep' : 'reps'}
         </span>
 
+        {recordingUrl ? (
+          <a
+            href={recordingUrl}
+            download={recordingFilename}
+            style={styles.downloadButton}
+          >
+            Download
+          </a>
+        ) : (
+          <button
+            onClick={handleToggleRecording}
+            style={{
+              ...styles.recordButton,
+              ...(recordingState === 'recording' ? styles.recordButtonActive : {}),
+            }}
+          >
+            {recordingState === 'recording'
+              ? '● Rec'
+              : recordingState === 'finalizing'
+                ? 'Saving...'
+                : 'Record'}
+          </button>
+        )}
+
         <button onClick={handleSwitchCamera} style={styles.switchCameraButton}>
           {facingMode === 'user' ? 'Back Camera' : 'Front Camera'}
         </button>
       </div>
+
+      {recordingError && (
+        <div style={styles.recordingError}>
+          {recordingError}
+        </div>
+      )}
 
       <div style={styles.cameraArea}>
         {cameraError ? (
@@ -341,7 +532,7 @@ const styles = {
     alignItems: 'center',
     padding:    '12px 16px',
     background: '#111',
-    gap:        '12px',
+    gap:        '8px',
     flexShrink: 0,
   },
   backButton: {
@@ -356,14 +547,48 @@ const styles = {
     minWidth:   0,
   },
   switchCameraButton: {
-    fontSize:     '13px',
+    fontSize:     '12px',
     color:        '#fff',
     background:   '#222',
     border:       '1px solid #444',
     borderRadius: '8px',
-    padding:      '8px 10px',
+    padding:      '8px 9px',
     cursor:       'pointer',
     whiteSpace:   'nowrap',
+  },
+  recordButton: {
+    fontSize:     '12px',
+    color:        '#fff',
+    background:   '#222',
+    border:       '1px solid #444',
+    borderRadius: '8px',
+    padding:      '8px 9px',
+    cursor:       'pointer',
+    whiteSpace:   'nowrap',
+  },
+  recordButtonActive: {
+    background: '#5a1111',
+    border:     '1px solid #cc3333',
+    color:      '#fff',
+  },
+  downloadButton: {
+    fontSize:       '12px',
+    color:          '#000',
+    background:     '#fff',
+    border:         '1px solid #fff',
+    borderRadius:   '8px',
+    padding:        '8px 9px',
+    cursor:         'pointer',
+    whiteSpace:     'nowrap',
+    textDecoration: 'none',
+    fontWeight:     '700',
+  },
+  recordingError: {
+    background: '#330000',
+    color:      '#ffaaaa',
+    fontSize:   '12px',
+    padding:    '6px 12px',
+    textAlign:  'center',
   },
   cameraArea: {
     flex:       1,
