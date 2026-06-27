@@ -1,5 +1,6 @@
+// src/logic/poseUtils.js
+
 // ── Landmark indices ──────────────────────────────────────────────────────────
-// These match MediaPipe's 33-point pose model - same in Python and JS
 export const LANDMARK_INDICES = {
   left_shoulder:    11,
   right_shoulder:   12,
@@ -22,16 +23,13 @@ export const LANDMARK_INDICES = {
 }
 
 /**
- * Extract the landmarks we care about from the raw MediaPipe results.
- * Returns an object like:
- * { left_hip: {x, y, z, visibility}, left_knee: {...}, ... }
+ * Extract landmarks from raw MediaPipe results.
  */
 export function extractLandmarks(rawLandmarks) {
   const result = {}
 
   for (const [name, idx] of Object.entries(LANDMARK_INDICES)) {
     const lm = rawLandmarks[idx]
-
     result[name] = {
       x:          lm.x,
       y:          lm.y,
@@ -75,7 +73,6 @@ export function computeAngles(landmarks, side) {
 
 /**
  * How far apart are the hips horizontally?
- * Low score = side-on, high score = front-facing.
  */
 export function lateralityScore(landmarks) {
   return Math.abs(landmarks.left_hip.x - landmarks.right_hip.x)
@@ -92,7 +89,6 @@ export function classifyCamera(score) {
 
 /**
  * Pick whichever side has better lower-body landmark visibility.
- * Used by squat/deadlift.
  */
 export function pickBestSide(landmarks, minVisibility = 0.5) {
   const leftScore = Math.min(
@@ -100,7 +96,6 @@ export function pickBestSide(landmarks, minVisibility = 0.5) {
     landmarks.left_knee?.visibility  ?? 0,
     landmarks.left_ankle?.visibility ?? 0,
   )
-
   const rightScore = Math.min(
     landmarks.right_hip?.visibility   ?? 0,
     landmarks.right_knee?.visibility  ?? 0,
@@ -115,17 +110,17 @@ export function pickBestSide(landmarks, minVisibility = 0.5) {
 
 /**
  * Check whether the lifter has reached squat depth.
- * Hip crease must be below the top of the knee.
- * Note: in normalised coordinates Y increases downward,
- * so hip.y > knee.y means hip is lower than knee.
+ * depthMargin adds a buffer so depth only triggers when hip is
+ * clearly below the knee, not just at the threshold.
+ * Fix 4: depth margin reduces false depth at threshold boundary.
  */
-export function checkDepth(landmarks, side, camera) {
+export function checkDepth(landmarks, side, camera, depthMargin = 0.01) {
   const hipY    = landmarks[`${side}_hip`].y
   const kneeY   = landmarks[`${side}_knee`].y
   const yMargin = hipY - kneeY
 
   if (camera === 'side-on') {
-    return { atDepth: yMargin > 0, margin: yMargin }
+    return { atDepth: yMargin > depthMargin, margin: yMargin }
   }
 
   if (camera === 'front-facing') {
@@ -133,17 +128,15 @@ export function checkDepth(landmarks, side, camera) {
     return { atDepth: angles.hip < 100, margin: (100 - angles.hip) / 100 }
   }
 
-  // diagonal
   const angles = computeAngles(landmarks, side)
   return {
-    atDepth: angles.hip < 105 && yMargin > -0.01,
+    atDepth: angles.hip < 105 && yMargin > (depthMargin - 0.01),
     margin:  yMargin,
   }
 }
 
 /**
- * Calculate hand to foot distance for front view deadlift detection.
- * Uses average of both sides for robustness.
+ * Calculate hand to foot distance for front view deadlift.
  */
 export function handFootDistance(landmarks) {
   const leftDist  = Math.abs(landmarks.left_wrist.y  - landmarks.left_ankle.y)
@@ -151,27 +144,36 @@ export function handFootDistance(landmarks) {
   return (leftDist + rightDist) / 2
 }
 
+// ── Visibility helpers ────────────────────────────────────────────────────────
+
+export function isVisible(lm, threshold = 0.5) {
+  return !!lm && (lm.visibility ?? 1) >= threshold
+}
+
+export function areVisible(landmarks, keys, threshold = 0.5) {
+  return keys.every(key => isVisible(landmarks[key], threshold))
+}
+
+export function visibleKeys(landmarks, keys, threshold = 0.5) {
+  return keys.filter(key => isVisible(landmarks[key], threshold))
+}
+
+export function missingKeys(landmarks, keys, threshold = 0.5) {
+  return keys.filter(key => !isVisible(landmarks[key], threshold))
+}
+
 // ── Bench press helpers ───────────────────────────────────────────────────────
 
-/**
- * Euclidean distance between two landmarks.
- * Rotation-invariant.
- */
 export function euclideanDistance(a, b) {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
 }
 
-/**
- * Pick best visible arm side for bench press.
- * Uses shoulder, elbow, wrist visibility only.
- */
 export function benchPickBestSide(landmarks, minVisibility = 0.5) {
   const leftScore = Math.min(
     landmarks.left_shoulder?.visibility ?? 0,
     landmarks.left_elbow?.visibility    ?? 0,
     landmarks.left_wrist?.visibility    ?? 0,
   )
-
   const rightScore = Math.min(
     landmarks.right_shoulder?.visibility ?? 0,
     landmarks.right_elbow?.visibility    ?? 0,
@@ -184,11 +186,6 @@ export function benchPickBestSide(landmarks, minVisibility = 0.5) {
   return bestScore > minVisibility ? best : null
 }
 
-/**
- * Compute elbow angle for bench press.
- * 180° = locked out.
- * Lower value = arm more bent.
- */
 export function computeElbowAngle(landmarks, side, minVisibility = 0.5) {
   const shoulder = landmarks[`${side}_shoulder`]
   const elbow    = landmarks[`${side}_elbow`]
@@ -205,14 +202,6 @@ export function computeElbowAngle(landmarks, side, minVisibility = 0.5) {
   return angleBetween(shoulder, elbow, wrist)
 }
 
-/**
- * Closest-side landmarks that bench side view should track.
- *
- * Important distinction:
- * - shoulder/elbow/wrist are used for commands and judging
- * - hip/knee/ankle/heel/foot_index are tracked passively for future faults
- * - far side is ignored
- */
 export function getBenchSideLandmarkKeys(side) {
   return [
     `${side}_shoulder`,
@@ -226,20 +215,73 @@ export function getBenchSideLandmarkKeys(side) {
   ]
 }
 
-// ── Visibility helpers ───────────────────────────────────────────────────────
+// ── Fix 1: Landmark smoother ──────────────────────────────────────────────────
+//
+// Maintains a rolling average of each landmark's x, y, z, visibility
+// over a short window of frames.
+//
+// This dramatically reduces jitter from MediaPipe noise, gym lighting,
+// occlusion, and clothing without adding meaningful delay.
+//
+// Window of 5 frames ≈ 167ms at 30fps.
+// Good balance of smoothness vs responsiveness.
+// Tune between 3 (snappier) and 8 (smoother) depending on environment.
 
-export function isVisible(lm, threshold = 0.5) {
-  return !!lm && (lm.visibility ?? 1) >= threshold
+export class LandmarkSmoother {
+  constructor(windowSize = 5) {
+    this.windowSize = windowSize
+    this.history = {}
+  }
+
+  smooth(landmarks) {
+    const smoothed = {}
+
+    for (const [name, lm] of Object.entries(landmarks)) {
+      if (!this.history[name]) {
+        this.history[name] = []
+      }
+
+      const hist = this.history[name]
+
+      hist.push({
+        x:          lm.x,
+        y:          lm.y,
+        z:          lm.z,
+        visibility: lm.visibility ?? 1.0,
+      })
+
+      if (hist.length > this.windowSize) hist.shift()
+
+      const n = hist.length
+
+      smoothed[name] = {
+        x:          hist.reduce((s, p) => s + p.x, 0) / n,
+        y:          hist.reduce((s, p) => s + p.y, 0) / n,
+        z:          hist.reduce((s, p) => s + p.z, 0) / n,
+        visibility: hist.reduce((s, p) => s + p.visibility, 0) / n,
+      }
+    }
+
+    return smoothed
+  }
+
+  reset() {
+    this.history = {}
+  }
 }
 
-export function areVisible(landmarks, keys, threshold = 0.5) {
-  return keys.every(key => isVisible(landmarks[key], threshold))
-}
+// ── Fix 2: Hysteresis helper ──────────────────────────────────────────────────
+//
+// Prevents binary state from flickering when a value jitters
+// at a threshold boundary.
+//
+// Example: knee angle jittering between 163° and 167° around a 165° threshold.
+// Without hysteresis: kneeLocked flips every frame.
+// With hysteresis (enter=165, exit=155): once locked, stays locked
+// until angle clearly drops below 155°.
 
-export function visibleKeys(landmarks, keys, threshold = 0.5) {
-  return keys.filter(key => isVisible(landmarks[key], threshold))
-}
-
-export function missingKeys(landmarks, keys, threshold = 0.5) {
-  return keys.filter(key => !isVisible(landmarks[key], threshold))
+export function updateHysteresis(currentState, value, enterThreshold, exitThreshold) {
+  if (!currentState && value >= enterThreshold) return true
+  if (currentState && value < exitThreshold) return false
+  return currentState
 }

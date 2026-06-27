@@ -19,8 +19,10 @@ import {
 } from '../logic/stateMachine'
 import StatusBar      from '../widgets/StatusBar'
 import ResultsOverlay from '../widgets/ResultsOverlay'
+import { extractLandmarks, isVisible, LandmarkSmoother } from '../logic/poseUtils'
 
 function CameraScreen() {
+  const landmarkSmootherRef = useRef(new LandmarkSmoother(5))
   const navigate                = useNavigate()
   const { liftId, angle, reps } = useParams()
 
@@ -219,7 +221,7 @@ function CameraScreen() {
 
         if (results.landmarks && results.landmarks.length > 0) {
           const rawLandmarks = results.landmarks[0]
-          const landmarks    = extractLandmarks(rawLandmarks)
+          const landmarks    = landmarkSmootherRef.current.smooth(extractLandmarks(rawLandmarks))
 
           let barY = null
           if (isBench && barDetectorRef.current) {
@@ -446,6 +448,7 @@ function CameraScreen() {
     setRepResults([])
     repResultsRef.current = []
     refereeRef.current?.reset()
+    landmarkSmootherRef.current.reset()
     navigate('/')
   }
 

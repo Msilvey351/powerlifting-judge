@@ -2,8 +2,8 @@ import { computeAngles, checkDepth, pickBestSide,
          lateralityScore, classifyCamera,
          handFootDistance, euclideanDistance,
          benchPickBestSide, computeElbowAngle,
-         getBenchSideLandmarkKeys, areVisible } from './poseUtils.js'
-
+         getBenchSideLandmarkKeys, areVisible,
+         updateHysteresis } from './poseUtils.js'
 
 import { ConcentricVelocityTracker } from './velocityTracker.js'
 import { estimateMetresPerNormUnit } from './velocityScale.js'
@@ -58,10 +58,7 @@ class StillnessDetector {
     let allStill = true
 
     for (const name of this.landmarkNames) {
-      if (!landmarks[name]) {
-        allStill = false
-        continue
-      }
+      if (!landmarks[name]) { allStill = false; continue }
 
       const pos     = { x: landmarks[name].x, y: landmarks[name].y }
       const history = this._history[name]
@@ -69,10 +66,7 @@ class StillnessDetector {
       history.push(pos)
       if (history.length > this.requiredFrames) history.shift()
 
-      if (history.length < this.requiredFrames) {
-        allStill = false
-        continue
-      }
+      if (history.length < this.requiredFrames) { allStill = false; continue }
 
       const xs      = history.map(p => p.x)
       const ys      = history.map(p => p.y)
@@ -92,7 +86,7 @@ class StillnessDetector {
 
     return {
       isStill:  allStill,
-      progress: this._stillFrames / this.requiredFrames
+      progress: this._stillFrames / this.requiredFrames,
     }
   }
 
@@ -102,9 +96,7 @@ class StillnessDetector {
   }
 }
 
-
-// ── Visibility policy helpers ────────────────────────────────────────────────
-
+// ── Visibility policy helpers ─────────────────────────────────────────────────
 function squatRequiredKeys(side) {
   return [
     `${side}_shoulder`,
@@ -117,15 +109,11 @@ function squatRequiredKeys(side) {
 function deadliftRequiredKeys(angle, side) {
   if (angle === 'front') {
     return [
-      'left_wrist',
-      'right_wrist',
-      'left_knee',
-      'right_knee',
-      'left_ankle',
-      'right_ankle',
+      'left_wrist',  'right_wrist',
+      'left_knee',   'right_knee',
+      'left_ankle',  'right_ankle',
     ]
   }
-
   return [
     `${side}_shoulder`,
     `${side}_hip`,
@@ -138,15 +126,10 @@ function deadliftRequiredKeys(angle, side) {
 function benchRequiredKeys(angle, side) {
   if (angle === 'front') {
     return [
-      'left_shoulder',
-      'left_elbow',
-      'left_wrist',
-      'right_shoulder',
-      'right_elbow',
-      'right_wrist',
+      'left_shoulder',  'left_elbow',  'left_wrist',
+      'right_shoulder', 'right_elbow', 'right_wrist',
     ]
   }
-
   return [
     `${side}_shoulder`,
     `${side}_elbow`,
@@ -155,28 +138,37 @@ function benchRequiredKeys(angle, side) {
 }
 
 function visibilityCheck(label, visible) {
-  return {
-    label,
-    passed: visible,
-  }
+  return { label, passed: visible }
 }
-
-
 
 // ── SquatReferee ──────────────────────────────────────────────────────────────
 export class SquatReferee {
-  constructor(onCommand, totalReps = 1, angle = 'side' , userProfile = null, stillnessFrames = 30, stillnessThreshold = 0.02) {
-    this.KNEE_LOCK_ANGLE    = 165
-    this.HIP_UPRIGHT_ANGLE  = 150
+  constructor(
+    onCommand,
+    totalReps = 1,
+    angle = 'side',
+    userProfile = null,
+    stillnessFrames = 30,
+    stillnessThreshold = 0.02
+  ) {
+    // ── Thresholds with hysteresis ──────────────────────────────────────────
+    // Fix 2: separate enter/exit thresholds prevent oscillation at boundary.
+    this.KNEE_LOCK_ENTER    = 165
+    this.KNEE_LOCK_EXIT     = 155
+    this.HIP_UPRIGHT_ENTER  = 150
+    this.HIP_UPRIGHT_EXIT   = 140
+
+    // Fix 3: minimum frames knee/hip must be locked before lockout confirmed.
+    this.LOCKOUT_HOLD_FRAMES = 6
+
     this.SETUP_HOLD_SECONDS = 2.0
 
     this.onCommand          = onCommand
     this.totalReps          = totalReps
+    this.angle              = angle.toLowerCase()
+    this.userProfile        = userProfile
     this.stillnessFrames    = stillnessFrames
     this.stillnessThreshold = stillnessThreshold
-
-    this.angle = angle.toLowerCase()
-    this.userProfile = userProfile
 
     this._reset()
   }
@@ -191,17 +183,25 @@ export class SquatReferee {
     this._depthAchieved  = false
     this._faults         = []
     this._lastSide       = null
-    this._velocityTracker = new ConcentricVelocityTracker()
-    this._downwardDetector = new DownwardMovementDetector(0.025, 3)
-    this._latestMetresPerNormUnit = null
-    this._detector       = new StillnessDetector(
+
+    // Fix 2: hysteresis state
+    this._kneeLocked     = false
+    this._hipUpright     = false
+
+    // Fix 3: lockout hold frames counter
+    this._lockoutFrames       = 0
+    this._lockoutConfirmed    = false
+
+    this._velocityTracker     = new ConcentricVelocityTracker()
+    this._downwardDetector    = new DownwardMovementDetector(0.025, 4)
+    this._latestScale         = null
+    this._detector            = new StillnessDetector(
       [], this.stillnessFrames, this.stillnessThreshold
     )
   }
 
   reset() {
     this._reset()
-    console.log('[RESET] Ready for next set.')
   }
 
   _updateDetector(landmarks, side) {
@@ -220,7 +220,6 @@ export class SquatReferee {
   _addFault(fault) {
     if (!this._faults.includes(fault)) {
       this._faults.push(fault)
-      console.log(`[FAULT] Rep ${this.currentRep}: ${fault}`)
     }
   }
 
@@ -231,28 +230,27 @@ export class SquatReferee {
 
   _completeRep() {
     const repResult = this._depthAchieved && this._faults.length === 0
-      ? LiftResult.WHITE
-      : LiftResult.RED
+      ? LiftResult.WHITE : LiftResult.RED
 
     const reasons = this._depthAchieved
       ? [...this._faults]
       : ['No depth', ...this._faults]
 
     this.repResults.push({
-      rep:    this.currentRep,
-      result: repResult,
-      faults: repResult === LiftResult.RED ? reasons : [],
-      velocity: this._velocityTracker.getMetrics(this._latestMetresPerNormUnit),
+      rep:      this.currentRep,
+      result:   repResult,
+      faults:   repResult === LiftResult.RED ? reasons : [],
+      velocity: this._velocityTracker.getMetrics(this._latestScale),
     })
-
-    console.log(`[REP ${this.currentRep}] ${repResult}${repResult === LiftResult.RED ? ' — ' + reasons.join(', ') : ''}`)
   }
 
   _resetForNextRep() {
-    this._depthAchieved  = false
-    this._hasMoved       = false
-    this._faults         = []
-    this._setupEntryTime = null
+    this._depthAchieved   = false
+    this._hasMoved        = false
+    this._faults          = []
+    this._setupEntryTime  = null
+    this._lockoutFrames   = 0
+    this._lockoutConfirmed = false
     this._velocityTracker.reset()
     this._downwardDetector.reset()
     this._detector.reset()
@@ -260,25 +258,9 @@ export class SquatReferee {
 
   update(landmarks) {
     const side = pickBestSide(landmarks)
-    if (!side) {
-      return {
-        state:      this.state,
-        result:     this.result,
-        progress:   0,
-        isStill:    false,
-        checks:     [],
-        currentRep: this.currentRep,
-        totalReps:  this.totalReps,
-        repResults: this.repResults,
-        side:       null,
-        camera:     null,
-      }
-    }
+    if (!side) return this._emptyReturn()
 
-    const score       = lateralityScore(landmarks)
-    const camera      = classifyCamera(score)
-
-    const requiredKeys = squatRequiredKeys(side)
+    const requiredKeys  = squatRequiredKeys(side)
     const jointsVisible = areVisible(landmarks, requiredKeys)
 
     if (!jointsVisible) {
@@ -287,41 +269,63 @@ export class SquatReferee {
         result:     this.result,
         progress:   0,
         isStill:    false,
-        checks: [
-          visibilityCheck('Required joints visible', false),
-        ],
+        checks:     [visibilityCheck('Required joints visible', false)],
         currentRep: this.currentRep,
         totalReps:  this.totalReps,
         repResults: this.repResults,
         side,
-        camera,
+        camera:     null,
       }
     }
 
-
-
+    const score       = lateralityScore(landmarks)
+    const camera      = classifyCamera(score)
     const angles      = computeAngles(landmarks, side)
     const { atDepth } = checkDepth(landmarks, side, camera)
     const { isStill, progress } = this._updateDetector(landmarks, side)
 
-    const kneeLocked = angles.knee >= this.KNEE_LOCK_ANGLE
-    const hipUpright = angles.hip  >= this.HIP_UPRIGHT_ANGLE
-
-    this._latestMetresPerNormUnit = estimateMetresPerNormUnit(
-      'squat',
-      this.angle,
-      landmarks,
-      side,
-      this.userProfile
+    // Fix 2: update hysteresis state for knee and hip
+    this._kneeLocked = updateHysteresis(
+      this._kneeLocked,
+      angles.knee,
+      this.KNEE_LOCK_ENTER,
+      this.KNEE_LOCK_EXIT
     )
 
+    this._hipUpright = updateHysteresis(
+      this._hipUpright,
+      angles.hip,
+      this.HIP_UPRIGHT_ENTER,
+      this.HIP_UPRIGHT_EXIT
+    )
+
+    const kneeLocked = this._kneeLocked
+    const hipUpright = this._hipUpright
+
+    this._latestScale = estimateMetresPerNormUnit(
+      'squat', this.angle, landmarks, side, this.userProfile
+    )
+
+    // Fix 3: lockout hold frame tracking
+    if (kneeLocked && hipUpright) {
+      this._lockoutFrames = Math.min(
+        this._lockoutFrames + 1,
+        this.LOCKOUT_HOLD_FRAMES + 1
+      )
+    } else {
+      this._lockoutFrames = 0
+      this._lockoutConfirmed = false
+    }
+
+    const lockoutConfirmed = this._lockoutFrames >= this.LOCKOUT_HOLD_FRAMES
+
     if (this.state === SquatState.WAITING) {
-      if (kneeLocked && hipUpright) {
+      if (lockoutConfirmed) {
         this.state = SquatState.SETUP
       }
 
     } else if (this.state === SquatState.SETUP) {
-      if (!(kneeLocked && hipUpright)) {
+      if (!lockoutConfirmed) {
         this.state           = SquatState.WAITING
         this._setupEntryTime = null
       } else if (isStill) {
@@ -334,6 +338,7 @@ export class SquatReferee {
           this._giveCommand('squat')
           this.state     = SquatState.DESCENDING
           this._hasMoved = false
+          this._lockoutFrames = 0
           this._detector.reset()
         }
       } else {
@@ -342,10 +347,11 @@ export class SquatReferee {
 
     } else if (this.state === SquatState.DESCENDING) {
       if (!kneeLocked) this._hasMoved = true
+
       if (atDepth) {
         this._depthAchieved = true
         this.state          = SquatState.DEPTH_ACHIEVED
-      } else if (this._hasMoved && kneeLocked && hipUpright && isStill) {
+      } else if (this._hasMoved && lockoutConfirmed && isStill) {
         this._addFault('Knees re-locked before depth')
         this.state = SquatState.LOCKOUT
       }
@@ -356,9 +362,8 @@ export class SquatReferee {
         this._velocityTracker.start(hipY)
 
         const wristY = getWristProxyY(landmarks)
-        if (wristY !== null){
-          this._downwardDetector.start(wristY)
-        }
+        if (wristY !== null) this._downwardDetector.start(wristY)
+
         this.state = SquatState.ASCENDING
       }
 
@@ -367,17 +372,16 @@ export class SquatReferee {
       this._velocityTracker.add(hipY)
 
       const wristY = getWristProxyY(landmarks)
-
       if (wristY !== null) {
         if (!this._downwardDetector.active) {
           this._downwardDetector.start(wristY)
-        } else if (this._downwardDetector.update(wristY)){
+        } else if (this._downwardDetector.update(wristY)) {
           this._addFault('Downward movement after ascent began')
         }
       }
 
-
-      if (kneeLocked) this.state = SquatState.LOCKOUT
+      // Fix 3: only transition to lockout once confirmed for N frames
+      if (lockoutConfirmed) this.state = SquatState.LOCKOUT
 
     } else if (this.state === SquatState.LOCKOUT) {
       if (!kneeLocked) {
@@ -399,15 +403,15 @@ export class SquatReferee {
       }
 
     } else if (this.state === SquatState.COMPLETE) {
-      // stay complete until manually reset
+      // stay complete
     }
 
     const checks = [
-      { label: 'Joints visible', passed: jointsVisible     },
-      { label: 'Hips upright', passed: hipUpright          },
-      { label: 'Knees locked', passed: kneeLocked          },
-      { label: 'Still',        passed: isStill             },
-      { label: 'Depth',        passed: this._depthAchieved },
+      { label: 'Joints visible', passed: jointsVisible        },
+      { label: 'Hips upright',   passed: hipUpright           },
+      { label: 'Knees locked',   passed: kneeLocked           },
+      { label: 'Still',          passed: isStill              },
+      { label: 'Depth',          passed: this._depthAchieved  },
     ]
 
     return {
@@ -422,6 +426,21 @@ export class SquatReferee {
       side,
       camera,
       angles,
+    }
+  }
+
+  _emptyReturn() {
+    return {
+      state:      this.state,
+      result:     this.result,
+      progress:   0,
+      isStill:    false,
+      checks:     [],
+      currentRep: this.currentRep,
+      totalReps:  this.totalReps,
+      repResults: this.repResults,
+      side:       null,
+      camera:     null,
     }
   }
 }
@@ -445,42 +464,41 @@ export const DEADLIFT_STATE_MESSAGES = {
 
 // ── DeadliftReferee ───────────────────────────────────────────────────────────
 export class DeadliftReferee {
-  constructor(onCommand, totalReps = 1, angle = 'side', stillnessFrames = 30, stillnessThreshold = 0.02, userProfile = null) {
-    this.KNEE_LOCK_ANGLE      = 160
+  constructor(
+    onCommand,
+    totalReps = 1,
+    angle = 'side',
+    stillnessFrames = 30,
+    stillnessThreshold = 0.02,
+    userProfile = null
+  ) {
+    // Fix 2: hysteresis thresholds
+    this.KNEE_LOCK_ENTER      = 160
+    this.KNEE_LOCK_EXIT       = 150
     this.HIP_LOCK_ANGLE       = 120
+    this.HIP_LOCK_EXIT        = 110
+    this.FRONT_KNEE_LOCK_ENTER = 172
+    this.FRONT_KNEE_LOCK_EXIT  = 162
+
     this.HINGE_HIP_ANGLE      = 130
     this.HINGE_KNEE_ANGLE     = 150
     this.SHOULDER_FORWARD_MAX = 20
 
-    this.HAND_FOOT_SETUP_THRESHOLD  = 0.3
-    this.HAND_FOOT_PULL_THRESHOLD   = 0.45
-    this.FRONT_KNEE_LOCK_ANGLE      = 172
+    this.HAND_FOOT_SETUP_THRESHOLD = 0.3
+    this.HAND_FOOT_PULL_THRESHOLD  = 0.45
 
+    // Fix 3: hold frames for lockout confirmation
     this.LOCKOUT_HOLD_FRAMES  = 20
     this.PULL_FRAMES_REQUIRED = 4
 
     this.onCommand          = onCommand
     this.totalReps          = totalReps
     this.angle              = angle.toLowerCase()
+    this.userProfile        = userProfile
     this.stillnessFrames    = stillnessFrames
     this.stillnessThreshold = stillnessThreshold
 
-    this.userProfile = userProfile
-
     this._reset()
-  }
-
-  _getDeadliftVelocityY(landmarks, side) {
-    if (this.angle === 'side') {
-      return landmarks[`${side}_wrist`]?.y ?? null
-    }
-
-    // Front view: average both wrists
-    const left  = landmarks.left_wrist
-    const right = landmarks.right_wrist
-    if (!left || !right) return null
-
-    return (left.y + right.y) / 2
   }
 
   _reset() {
@@ -494,10 +512,15 @@ export class DeadliftReferee {
     this._hipAngleHistory   = []
     this._handDistHistory   = []
     this._confirmedHinge    = false
-    this._velocityTracker   = new ConcentricVelocityTracker()
-    this._latestMetresPerNormUnit = null
-    this._downwardDetector = new DownwardMovementDetector(0.015, 3)
     this._lastSide          = null
+
+    // Fix 2: hysteresis state
+    this._kneeLocked        = false
+    this._hipLocked         = false
+
+    this._velocityTracker   = new ConcentricVelocityTracker()
+    this._downwardDetector  = new DownwardMovementDetector(0.015, 4)
+    this._latestScale       = null
     this._detector          = new StillnessDetector(
       [], this.stillnessFrames, this.stillnessThreshold
     )
@@ -505,7 +528,6 @@ export class DeadliftReferee {
 
   reset() {
     this._reset()
-    console.log('[RESET] Deadlift ready for next set.')
   }
 
   _updateDetector(landmarks, side) {
@@ -522,10 +544,7 @@ export class DeadliftReferee {
   }
 
   _addFault(fault) {
-    if (!this._faults.includes(fault)) {
-      this._faults.push(fault)
-      console.log(`[FAULT] Rep ${this.currentRep}: ${fault}`)
-    }
+    if (!this._faults.includes(fault)) this._faults.push(fault)
   }
 
   _giveCommand(command) {
@@ -535,17 +554,14 @@ export class DeadliftReferee {
 
   _completeRep() {
     const repResult = this._faults.length === 0
-      ? LiftResult.WHITE
-      : LiftResult.RED
+      ? LiftResult.WHITE : LiftResult.RED
 
     this.repResults.push({
       rep:      this.currentRep,
       result:   repResult,
       faults:   repResult === LiftResult.RED ? [...this._faults] : [],
-      velocity: this._velocityTracker.getMetrics(this._latestMetresPerNormUnit),
+      velocity: this._velocityTracker.getMetrics(this._latestScale),
     })
-
-    console.log(`[REP ${this.currentRep}] ${repResult}`)
   }
 
   _resetForNextRep() {
@@ -555,8 +571,20 @@ export class DeadliftReferee {
     this._hipAngleHistory = []
     this._handDistHistory = []
     this._confirmedHinge  = false
+    this._kneeLocked      = false
+    this._hipLocked       = false
     this._velocityTracker.reset()
     this._downwardDetector.reset()
+  }
+
+  _getDeadliftVelocityY(landmarks, side) {
+    if (this.angle === 'side') {
+      return landmarks[`${side}_wrist`]?.y ?? null
+    }
+    const left  = landmarks.left_wrist
+    const right = landmarks.right_wrist
+    if (!left || !right) return null
+    return (left.y + right.y) / 2
   }
 
   _isHipLocked(landmarks, side, angles) {
@@ -572,57 +600,38 @@ export class DeadliftReferee {
     const shoulder = landmarks[`${side}_shoulder`]
     const hip      = landmarks[`${side}_hip`]
     if (!shoulder || !hip) return true
-    const dx          = shoulder.x - hip.x
-    const dy          = shoulder.y - hip.y
-    const torsoAngle  = Math.atan2(dx, -dy) * 180 / Math.PI
-    const forwardLean = side === 'left' ? torsoAngle : -torsoAngle
-    return forwardLean < this.SHOULDER_FORWARD_MAX
+    const dx         = shoulder.x - hip.x
+    const dy         = shoulder.y - hip.y
+    const torsoAngle = Math.atan2(dx, -dy) * 180 / Math.PI
+    const lean       = side === 'left' ? torsoAngle : -torsoAngle
+    return lean < this.SHOULDER_FORWARD_MAX
   }
 
   _isSustainedPullSide() {
     if (this._hipAngleHistory.length < this.PULL_FRAMES_REQUIRED) return false
     const recent = this._hipAngleHistory.slice(-this.PULL_FRAMES_REQUIRED)
-    let risingFrames = 0
+    let rising = 0
     for (let i = 1; i < recent.length; i++) {
-      if (recent[i] > recent[i - 1]) risingFrames++
+      if (recent[i] > recent[i - 1]) rising++
     }
-    return risingFrames >= this.PULL_FRAMES_REQUIRED - 1
+    return rising >= this.PULL_FRAMES_REQUIRED - 1
   }
 
   _isSustainedPullFront() {
     if (this._handDistHistory.length < this.PULL_FRAMES_REQUIRED) return false
     const recent = this._handDistHistory.slice(-this.PULL_FRAMES_REQUIRED)
-    let risingFrames = 0
+    let rising = 0
     for (let i = 1; i < recent.length; i++) {
-      if (recent[i] > recent[i - 1]) risingFrames++
+      if (recent[i] > recent[i - 1]) rising++
     }
-    return risingFrames >= this.PULL_FRAMES_REQUIRED - 1
-  }
-
-  _isLockedOutFront(landmarks, angles) {
-    return angles.knee >= this.FRONT_KNEE_LOCK_ANGLE
+    return rising >= this.PULL_FRAMES_REQUIRED - 1
   }
 
   update(landmarks) {
     const side = pickBestSide(landmarks)
-    if (!side) {
-      return {
-        state:      this.state,
-        result:     this.result,
-        progress:   0,
-        isStill:    false,
-        checks:     [],
-        currentRep: this.currentRep,
-        totalReps:  this.totalReps,
-        repResults: this.repResults,
-        side:       null,
-      }
-    }
+    if (!side) return this._emptyReturn()
 
-    const score    = lateralityScore(landmarks)
-    const camera   = classifyCamera(score)
-
-    const requiredKeys = deadliftRequiredKeys(this.angle, side)
+    const requiredKeys  = deadliftRequiredKeys(this.angle, side)
     const jointsVisible = areVisible(landmarks, requiredKeys)
 
     if (!jointsVisible) {
@@ -631,41 +640,48 @@ export class DeadliftReferee {
         result:     this.result,
         progress:   0,
         isStill:    false,
-        checks: [
-          visibilityCheck('Required joints visible', false),
-        ],
+        checks:     [visibilityCheck('Required joints visible', false)],
         currentRep: this.currentRep,
         totalReps:  this.totalReps,
         repResults: this.repResults,
         side,
-        camera,
       }
     }
 
-
-    const angles   = computeAngles(landmarks, side)
+    const score  = lateralityScore(landmarks)
+    const camera = classifyCamera(score)
+    const angles = computeAngles(landmarks, side)
     const { isStill, progress } = this._updateDetector(landmarks, side)
-    this._latestMetresPerNormUnit = estimateMetresPerNormUnit(
-      'deadlift',
-      this.angle,
-      landmarks,
-      side,
-      this.userProfile
-    )
 
+    this._latestScale = estimateMetresPerNormUnit(
+      'deadlift', this.angle, landmarks, side, this.userProfile
+    )
 
     let kneeLocked    = false
     let hipLocked     = false
     let shouldersBack = true
     let isHinged      = false
     let sustainedPull = false
-    let handDist      = 0
 
     if (this.angle === 'side') {
-      kneeLocked    = angles.knee >= this.KNEE_LOCK_ANGLE
-      hipLocked     = this._isHipLocked(landmarks, side, angles)
+      // Fix 2: hysteresis on knee and hip locked
+      this._kneeLocked = updateHysteresis(
+        this._kneeLocked, angles.knee,
+        this.KNEE_LOCK_ENTER, this.KNEE_LOCK_EXIT
+      )
+
+      const hipLockedRaw = this._isHipLocked(landmarks, side, angles)
+      this._hipLocked = updateHysteresis(
+        this._hipLocked,
+        hipLockedRaw ? this.HIP_LOCK_ANGLE + 1 : 0,
+        this.HIP_LOCK_ANGLE,
+        this.HIP_LOCK_EXIT
+      )
+
+      kneeLocked    = this._kneeLocked
+      hipLocked     = this._hipLocked || this._isHipLocked(landmarks, side, angles)
       shouldersBack = this._isShouldersBack(landmarks, side)
-      isHinged      = angles.hip  < this.HINGE_HIP_ANGLE &&
+      isHinged      = angles.hip < this.HINGE_HIP_ANGLE &&
                       angles.knee < this.HINGE_KNEE_ANGLE
 
       this._hipAngleHistory.push(angles.hip)
@@ -673,10 +689,16 @@ export class DeadliftReferee {
       sustainedPull = this._isSustainedPullSide()
 
     } else {
-      kneeLocked = angles.knee >= this.FRONT_KNEE_LOCK_ANGLE
+      // Fix 2: hysteresis on front-view knee
+      this._kneeLocked = updateHysteresis(
+        this._kneeLocked, angles.knee,
+        this.FRONT_KNEE_LOCK_ENTER, this.FRONT_KNEE_LOCK_EXIT
+      )
+
+      kneeLocked = this._kneeLocked
       hipLocked  = true
 
-      handDist = handFootDistance(landmarks)
+      const handDist = handFootDistance(landmarks)
       this._handDistHistory.push(handDist)
       if (this._handDistHistory.length > 10) this._handDistHistory.shift()
 
@@ -693,9 +715,7 @@ export class DeadliftReferee {
       }
 
     } else if (this.state === DeadliftState.SETUP) {
-      if (isHinged) {
-        this._confirmedHinge = true
-      }
+      if (isHinged) this._confirmedHinge = true
 
       if (this._confirmedHinge && sustainedPull) {
         this._hipAngleHistory = []
@@ -705,9 +725,7 @@ export class DeadliftReferee {
         this._velocityTracker.start(y)
 
         const wristY = getWristProxyY(landmarks)
-        if (wristY !== null) {
-          this._downwardDetector.start(wristY)
-        }
+        if (wristY !== null) this._downwardDetector.start(wristY)
 
         this.currentRep++
         this.state = DeadliftState.PULLING
@@ -722,7 +740,6 @@ export class DeadliftReferee {
       this._velocityTracker.add(y)
 
       const wristY = getWristProxyY(landmarks)
-
       if (wristY !== null) {
         if (!this._downwardDetector.active) {
           this._downwardDetector.start(wristY)
@@ -769,19 +786,19 @@ export class DeadliftReferee {
       }
 
     } else if (this.state === DeadliftState.COMPLETE) {
-      // stay complete until manually reset
+      // stay complete
     }
 
     const checks = this.angle === 'side'
       ? [
-          { label: 'Joints visible', passed: jointsVisible},
+          { label: 'Joints visible', passed: jointsVisible },
           { label: 'Knees locked',   passed: kneeLocked    },
           { label: 'Hips through',   passed: hipLocked      },
           { label: 'Shoulders back', passed: shouldersBack  },
           { label: 'Still',          passed: isStill        },
         ]
       : [
-          {label: 'Joints visible', passed: jointsVisible },
+          { label: 'Joints visible', passed: jointsVisible },
           { label: 'Knees locked',   passed: kneeLocked    },
           { label: 'Still',          passed: isStill        },
         ]
@@ -798,6 +815,20 @@ export class DeadliftReferee {
       side,
       camera,
       angles,
+    }
+  }
+
+  _emptyReturn() {
+    return {
+      state:      this.state,
+      result:     this.result,
+      progress:   0,
+      isStill:    false,
+      checks:     [],
+      currentRep: this.currentRep,
+      totalReps:  this.totalReps,
+      repResults: this.repResults,
+      side:       null,
     }
   }
 }
@@ -824,8 +855,17 @@ export const BENCH_STATE_MESSAGES = {
 }
 
 export class BenchReferee {
-  constructor(onCommand, totalReps = 1, angle = 'side', calibration = null, userProfile = null) {
-    this.ELBOW_LOCK_ANGLE      = 160
+  constructor(
+    onCommand,
+    totalReps = 1,
+    angle = 'side',
+    calibration = null,
+    userProfile = null
+  ) {
+    // Fix 2: hysteresis on elbow lockout
+    this.ELBOW_LOCK_ENTER      = 160
+    this.ELBOW_LOCK_EXIT       = 150
+
     this.CHEST_RATIO_TOLERANCE = 0.06
     this.VELOCITY_THRESHOLD    = 0.004
     this.LOCKOUT_HOLD_FRAMES   = 20
@@ -836,18 +876,9 @@ export class BenchReferee {
     this.totalReps   = totalReps
     this.angle       = angle.toLowerCase()
     this.calibration = calibration
-
     this.userProfile = userProfile
 
     this._reset()
-  }
-
-    _getBenchVelocityY(landmarks, side, barY = null) {
-    // Prefer actual detected bar position if available
-    if (barY != null && !Number.isNaN(barY)) return barY
-
-    // Fallback to wrist Y
-    return landmarks[`${side}_wrist`]?.y ?? null
   }
 
   _reset() {
@@ -871,9 +902,12 @@ export class BenchReferee {
     this._startCommandFired   = false
     this._chestReached        = false
 
-    this._velocityTracker = new ConcentricVelocityTracker()
-    this._latestMetresPerNormUnit = null
-    this._downwardDetector = new DownwardMovementDetector(0.015, 3)
+    // Fix 2: hysteresis state for elbow lockout
+    this._elbowLockedHyst     = false
+
+    this._velocityTracker     = new ConcentricVelocityTracker()
+    this._downwardDetector    = new DownwardMovementDetector(0.015, 4)
+    this._latestScale         = null
   }
 
   reset() {
@@ -895,16 +929,10 @@ export class BenchReferee {
 
     this._velocityTracker.reset()
     this._downwardDetector.reset()
-
-    // Do NOT clear _lockedSide here.
-    // Once selected at setup, the side remains locked for the whole set.
   }
 
   _addFault(fault) {
-    if (!this._faults.includes(fault)) {
-      this._faults.push(fault)
-      console.log(`[FAULT] Bench rep ${this.currentRep}: ${fault}`)
-    }
+    if (!this._faults.includes(fault)) this._faults.push(fault)
   }
 
   _giveCommand(command) {
@@ -914,8 +942,7 @@ export class BenchReferee {
 
   _completeRep() {
     const repResult = this._chestReached && this._faults.length === 0
-      ? LiftResult.WHITE
-      : LiftResult.RED
+      ? LiftResult.WHITE : LiftResult.RED
 
     const reasons = this._chestReached
       ? [...this._faults]
@@ -925,13 +952,8 @@ export class BenchReferee {
       rep:      this.currentRep,
       result:   repResult,
       faults:   repResult === LiftResult.RED ? reasons : [],
-      velocity: this._velocityTracker.getMetrics(this._latestMetresPerNormUnit),
+      velocity: this._velocityTracker.getMetrics(this._latestScale),
     })
-
-    console.log(
-      `[BENCH REP ${this.currentRep}] ${repResult}` +
-      (repResult === LiftResult.RED ? ` — ${reasons.join(', ')}` : '')
-    )
   }
 
   _updateWristHistory(landmarks, side) {
@@ -940,7 +962,6 @@ export class BenchReferee {
 
     this._wristHistory.push({ x: wrist.x, y: wrist.y })
     if (this._wristHistory.length > 5) this._wristHistory.shift()
-
     if (this._wristHistory.length < 2) return Infinity
 
     const prev = this._wristHistory[this._wristHistory.length - 2]
@@ -951,49 +972,34 @@ export class BenchReferee {
 
   _updateElbowHistory(elbowAngle) {
     this._elbowAngleHistory.push(elbowAngle)
-    if (this._elbowAngleHistory.length > 8) {
-      this._elbowAngleHistory.shift()
-    }
+    if (this._elbowAngleHistory.length > 8) this._elbowAngleHistory.shift()
   }
 
   _elbowAtLocalMinimum() {
     const h = this._elbowAngleHistory
     if (h.length < 4) return false
-
-    const previous = h.slice(0, -1)
-    const minPrev  = Math.min(...previous)
-
+    const minPrev = Math.min(...h.slice(0, -1))
     return h[h.length - 1] > minPrev + 3
   }
 
   _getSide(landmarks) {
     const detectedSide = benchPickBestSide(landmarks)
-
-    // If side is already locked, never switch.
     if (this._lockedSide) return this._lockedSide
-
     return detectedSide
   }
 
   _lockSide(side) {
     if (!side) return
-
     this._lockedSide = side
 
-    // Bench side view tracks closest-side upper + lower landmarks.
-    // Lower-body landmarks are passive for now.
     if (this.angle === 'side') {
       this._trackedLandmarkKeys = getBenchSideLandmarkKeys(side)
     } else {
-      // For front view, lower body should be ignored.
-      // Current command logic still uses selected arm side.
       this._trackedLandmarkKeys = [
-        'left_shoulder', 'left_elbow', 'left_wrist',
+        'left_shoulder',  'left_elbow',  'left_wrist',
         'right_shoulder', 'right_elbow', 'right_wrist',
       ]
     }
-
-    console.log(`[BenchReferee] locked side: ${side}`)
   }
 
   _isAtChest(landmarks, side, elbowAngle, wristVelocity) {
@@ -1016,15 +1022,19 @@ export class BenchReferee {
       }
     }
 
-    // Fallback if no calibration.
     return elbowAngle < 100 && wristStill && this._elbowAtLocalMinimum()
+  }
+
+  _getBenchVelocityY(landmarks, side, barY = null) {
+    if (barY != null && !Number.isNaN(barY)) return barY
+    return landmarks[`${side}_wrist`]?.y ?? null
   }
 
   update(landmarks, barY = null) {
     const side = this._getSide(landmarks)
     if (!side) return this._emptyReturn()
 
-    const requiredKeys = benchRequiredKeys(this.angle, side)
+    const requiredKeys  = benchRequiredKeys(this.angle, side)
     const jointsVisible = areVisible(landmarks, requiredKeys)
 
     if (!jointsVisible) {
@@ -1033,9 +1043,7 @@ export class BenchReferee {
         side,
         lockedSide: this._lockedSide,
         trackedLandmarkKeys: this._trackedLandmarkKeys,
-        checks: [
-          visibilityCheck('Required joints visible', false),
-        ],
+        checks: [visibilityCheck('Required joints visible', false)],
       }
     }
 
@@ -1047,53 +1055,44 @@ export class BenchReferee {
         side,
         lockedSide: this._lockedSide,
         trackedLandmarkKeys: this._trackedLandmarkKeys,
-        checks: [
-          visibilityCheck('Required joints visible', false),
-        ],
+        checks: [visibilityCheck('Required joints visible', false)],
       }
     }
 
     const wristVelocity = this._updateWristHistory(landmarks, side)
     const wristStill    = wristVelocity < this.VELOCITY_THRESHOLD
-    const lockedOut     = elbowAngle >= this.ELBOW_LOCK_ANGLE
+
+    // Fix 2: hysteresis on elbow lockout
+    this._elbowLockedHyst = updateHysteresis(
+      this._elbowLockedHyst,
+      elbowAngle,
+      this.ELBOW_LOCK_ENTER,
+      this.ELBOW_LOCK_EXIT
+    )
+    const lockedOut = this._elbowLockedHyst
 
     this._updateElbowHistory(elbowAngle)
 
-    this._latestMetresPerNormUnit = estimateMetresPerNormUnit(
-      'bench',
-      this.angle,
-      landmarks,
-      side,
-      this.userProfile
+    const atChest = this._isAtChest(landmarks, side, elbowAngle, wristVelocity)
+
+    this._latestScale = estimateMetresPerNormUnit(
+      'bench', this.angle, landmarks, side, this.userProfile
     )
 
-    const atChest = this._isAtChest(
-      landmarks,
-      side,
-      elbowAngle,
-      wristVelocity
-    )
-
-    // ── WAITING ─────────────────────────────────────────────────────────────
     if (this.state === BenchState.WAITING) {
       if (lockedOut) {
         this.state          = BenchState.SETUP
         this._lockoutFrames = 0
       }
 
-    // ── SETUP ───────────────────────────────────────────────────────────────
     } else if (this.state === BenchState.SETUP) {
       if (!lockedOut) {
         this.state          = BenchState.WAITING
         this._lockoutFrames = 0
       } else if (wristStill) {
         this._lockoutFrames++
-
         if (this._lockoutFrames >= this.SETUP_HOLD_FRAMES) {
-          // Lock the side here.
-          // From now until reset, only this side affects judging/commands.
           this._lockSide(side)
-
           this.state              = BenchState.LOCKOUT
           this._lockoutFrames     = 0
           this._startCommandFired = false
@@ -1102,9 +1101,7 @@ export class BenchReferee {
         this._lockoutFrames = Math.max(0, this._lockoutFrames - 1)
       }
 
-    // ── LOCKOUT ─────────────────────────────────────────────────────────────
     } else if (this.state === BenchState.LOCKOUT) {
-      // If a rep has just been pressed to lockout, confirm lockout and complete it.
       if (this._pendingCompletion) {
         if (lockedOut && wristStill) {
           this._lockoutFrames++
@@ -1118,7 +1115,6 @@ export class BenchReferee {
               this.result = LiftResult.WHITE
               this.state  = BenchState.COMPLETE
             } else {
-              // Stay at lockout. Wait for next START and next actual descent.
               this._resetForNextRepTop()
               this.state = BenchState.LOCKOUT
             }
@@ -1127,7 +1123,6 @@ export class BenchReferee {
           this._lockoutFrames = Math.max(0, this._lockoutFrames - 1)
         }
 
-      // Stable top position before a rep. Give START once.
       } else if (!this._repInProgress && this.currentRep < this.totalReps) {
         if (lockedOut && wristStill && !this._startCommandFired) {
           this._lockoutFrames++
@@ -1139,10 +1134,8 @@ export class BenchReferee {
           }
         }
 
-        // Rep starts only when the lifter actually descends.
         if (!lockedOut) {
           this.currentRep++
-
           this._repInProgress     = true
           this._chestReached      = false
           this._pressCommandFired = false
@@ -1150,12 +1143,10 @@ export class BenchReferee {
           this._chestFrames       = 0
           this._elbowAngleHistory = []
           this._wristHistory      = []
-
-          this.state = BenchState.DESCENDING
+          this.state              = BenchState.DESCENDING
         }
       }
 
-    // ── DESCENDING ──────────────────────────────────────────────────────────
     } else if (this.state === BenchState.DESCENDING) {
       if (atChest) {
         this._chestReached = true
@@ -1163,7 +1154,6 @@ export class BenchReferee {
         this.state         = BenchState.CHEST
       }
 
-      // If they go back to lockout without chest, complete as red.
       if (lockedOut && this._repInProgress && !this._chestReached) {
         this._addFault('Bar did not reach chest')
         this._pendingCompletion = true
@@ -1171,15 +1161,11 @@ export class BenchReferee {
         this.state              = BenchState.LOCKOUT
       }
 
-    // ── CHEST ───────────────────────────────────────────────────────────────
     } else if (this.state === BenchState.CHEST) {
       if (atChest && wristStill) {
         this._chestFrames++
 
-        if (
-          this._chestFrames >= this.CHEST_HOLD_FRAMES &&
-          !this._pressCommandFired
-        ) {
+        if (this._chestFrames >= this.CHEST_HOLD_FRAMES && !this._pressCommandFired) {
           this._giveCommand('press')
           this._pressCommandFired = true
         }
@@ -1189,20 +1175,16 @@ export class BenchReferee {
         this._velocityTracker.start(y)
 
         const wristY = getWristProxyY(landmarks)
-        if (wristY !== null) {
-          this._downwardDetector.start(wristY)
-        }
+        if (wristY !== null) this._downwardDetector.start(wristY)
 
         this.state = BenchState.PRESSING
       }
 
-    // ── PRESSING ────────────────────────────────────────────────────────────
     } else if (this.state === BenchState.PRESSING) {
       const y = this._getBenchVelocityY(landmarks, side, barY)
       this._velocityTracker.add(y)
 
       const wristY = getWristProxyY(landmarks)
-
       if (wristY !== null) {
         if (!this._downwardDetector.active) {
           this._downwardDetector.start(wristY)
@@ -1211,12 +1193,10 @@ export class BenchReferee {
         }
       }
 
-      // If it drops back to chest, return to chest state.
       if (atChest) {
         this.state = BenchState.CHEST
       }
 
-      // Rep is only completed after lockout is held.
       if (lockedOut) {
         this._pendingCompletion = true
         this._lockoutFrames     = 0
@@ -1232,7 +1212,7 @@ export class BenchReferee {
 
   _buildReturn(side, elbowAngle, wristVelocity, atChest, barY = null) {
     const wristStill = wristVelocity < this.VELOCITY_THRESHOLD
-    const lockedOut  = elbowAngle >= this.ELBOW_LOCK_ANGLE
+    const lockedOut  = this._elbowLockedHyst
 
     const progress = this.state === BenchState.SETUP
       ? this._lockoutFrames / this.SETUP_HOLD_FRAMES
@@ -1247,11 +1227,11 @@ export class BenchReferee {
       result:     this.result,
       progress,
       checks: [
-        {label: 'Arm joints visible', passed: true },
-        { label: 'Arms locked',  passed: lockedOut                 },
-        { label: 'Wrist still',  passed: wristStill                },
-        { label: 'Bar at chest', passed: atChest                   },
-        { label: 'Calibrated',   passed: this.calibration !== null },
+        { label: 'Arm joints visible', passed: true          },
+        { label: 'Arms locked',        passed: lockedOut     },
+        { label: 'Wrist still',        passed: wristStill    },
+        { label: 'Bar at chest',       passed: atChest       },
+        { label: 'Calibrated',         passed: this.calibration !== null },
       ],
       currentRep: this.currentRep,
       totalReps:  this.totalReps,
