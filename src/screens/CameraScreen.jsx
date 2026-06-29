@@ -396,14 +396,12 @@ function CameraScreen() {
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
         )
 
-        const modelAssetPath = isBench
-        ? 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task'
-        : 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task'
+        
 
 
         poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
           baseOptions: {
-            modelAssetPath,
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task',
             delegate: 'GPU'
           },
           runningMode: 'VIDEO',
