@@ -1,27 +1,31 @@
 // src/screens/CalibrationScreen.jsx
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate, useParams }                   from 'react-router-dom'
-import { PoseLandmarker, FilesetResolver, DrawingUtils } from '@mediapipe/tasks-vision'
+import { PoseLandmarker, FilesetResolver }          from '@mediapipe/tasks-vision'
+import { DrawingUtils }                             from '@mediapipe/tasks-vision'
 import { extractLandmarks, euclideanDistance,
-         benchPickBestSide, computeElbowAngle }     from '../logic/poseUtils'
+         benchPickBestSide, computeElbowAngle,
+         LandmarkSmoother }                         from '../logic/poseUtils'
+import { drawRelevantVisiblePose }                  from '../logic/drawingPolicy'
 import { saveCalibration, getCalibration }          from '../logic/calibrationStore'
+import { speakCommand, initAudio }                  from '../logic/audio'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const TOTAL_REPS        = 3
-const HOLD_FRAMES       = 20    // frames still needed to confirm lockout or chest
+const HOLD_FRAMES       = 20
 const VELOCITY_THRESH   = 0.005
 const ELBOW_LOCK_ANGLE  = 155
-const ELBOW_CHEST_ANGLE = 110   // below this = bar is approaching chest
+const ELBOW_CHEST_ANGLE = 110
 
-// ── Calibration state machine states ─────────────────────────────────────────
+// ── Calibration states ────────────────────────────────────────────────────────
 const CalState = {
-  LOADING:    'LOADING',     // mediapipe not ready yet
-  WAITING:    'WAITING',     // waiting for lifter to get into position
-  LOCKOUT:    'LOCKOUT',     // holding at lockout
-  DESCENDING: 'DESCENDING',  // bar going down
-  CHEST:      'CHEST',       // holding at chest
-  ASCENDING:  'ASCENDING',   // bar going up
-  DONE:       'DONE',        // all 3 reps recorded
+  LOADING:    'LOADING',
+  WAITING:    'WAITING',
+  LOCKOUT:    'LOCKOUT',
+  DESCENDING: 'DESCENDING',
+  CHEST:      'CHEST',
+  ASCENDING:  'ASCENDING',
+  DONE:       'DONE',
 }
 
 export default function CalibrationScreen() {
@@ -34,31 +38,34 @@ export default function CalibrationScreen() {
   const canvasRef         = useRef(null)
   const poseLandmarkerRef = useRef(null)
   const animFrameRef      = useRef(null)
+  const smootherRef       = useRef(new LandmarkSmoother(6))
 
-  // ── Calibration data refs (mutated each frame, not React state) ───────────
+  // ── Calibration data refs ─────────────────────────────────────────────────
   const calStateRef       = useRef(CalState.LOADING)
   const holdFramesRef     = useRef(0)
   const wristHistoryRef   = useRef([])
-  const lockoutSamplesRef = useRef([])   // armExtended per rep
-  const chestSamplesRef   = useRef([])   // armBent per rep
+  const lockoutSamplesRef = useRef([])
+  const chestSamplesRef   = useRef([])
   const repCountRef       = useRef(0)
   const calSideRef        = useRef(null)
 
-  // ── React state (UI only) ─────────────────────────────────────────────────
-  const [uiState,      setUiState]      = useState(CalState.LOADING)
-  const [instruction,  setInstruction]  = useState('Loading camera...')
-  const [repCount,     setRepCount]     = useState(0)
-  const [progress,     setProgress]     = useState(0)
-  const [cameraError,  setCameraError]  = useState(null)
-  const [existingCal,  setExistingCal]  = useState(null)
-  const [savedRatio,   setSavedRatio]   = useState(null)
+  // Tracks whether start/press/rack have fired for current rep
+  // to avoid repeat commands
+  const startFiredRef     = useRef(false)
+  const pressFiredRef     = useRef(false)
 
-  // Check for existing calibration on mount
+  // ── React state ───────────────────────────────────────────────────────────
+  const [uiState,      setUiState]     = useState(CalState.LOADING)
+  const [instruction,  setInstruction] = useState('Loading camera...')
+  const [repCount,     setRepCount]    = useState(0)
+  const [progress,     setProgress]    = useState(0)
+  const [cameraError,  setCameraError] = useState(null)
+  const [existingCal,  setExistingCal] = useState(null)
+  const [savedRatio,   setSavedRatio]  = useState(null)
+
   useEffect(() => {
     const cal = getCalibration(liftId, view)
-    if (cal) {
-      setExistingCal(cal)
-    }
+    if (cal) setExistingCal(cal)
   }, [liftId, view])
 
   // ── Wrist velocity ────────────────────────────────────────────────────────
@@ -81,8 +88,8 @@ export default function CalibrationScreen() {
     const lm     = poseLandmarkerRef.current
     if (!video || !canvas || !lm) return
 
-    const ctx  = canvas.getContext('2d')
-    const draw = new DrawingUtils(ctx)
+    const ctx          = canvas.getContext('2d')
+    const drawingUtils = new DrawingUtils(ctx)
 
     const loop = () => {
       canvas.width  = video.videoWidth
@@ -93,14 +100,28 @@ export default function CalibrationScreen() {
         const results = lm.detectForVideo(video, performance.now())
 
         if (results.landmarks?.length > 0) {
-          const raw = results.landmarks[0]
-          draw.drawConnectors(raw, PoseLandmarker.POSE_CONNECTIONS,
-            { color: '#00FF00', lineWidth: 2 })
-          draw.drawLandmarks(raw,
-            { color: '#FF0000', lineWidth: 1, radius: 3 })
-
-          const landmarks = extractLandmarks(raw)
+          const raw       = results.landmarks[0]
+          const landmarks = smootherRef.current.smooth(extractLandmarks(raw))
           const side      = benchPickBestSide(landmarks)
+
+          // Build a minimal update object for drawing policy
+          // so drawRelevantVisiblePose knows the locked side
+          const drawUpdate = {
+            side,
+            lockedSide: calSideRef.current,
+          }
+
+          // Draw only relevant visible joints for bench
+          drawRelevantVisiblePose({
+            drawingUtils,
+            rawLandmarks: raw,
+            liftId:       'bench',
+            angle,
+            update:       drawUpdate,
+            landmarkStyle:  { color: '#FF0000', lineWidth: 1, radius: 3 },
+            connectorStyle: { color: '#00FF00', lineWidth: 2 },
+            visibilityThreshold: 0.4,
+          })
 
           if (!side) {
             setInstruction('Hold arms in frame')
@@ -108,26 +129,33 @@ export default function CalibrationScreen() {
             return
           }
 
-          // Lock side for consistency across all reps
           if (!calSideRef.current) calSideRef.current = side
 
-          const elbowAngle    = computeElbowAngle(landmarks, calSideRef.current)
-          const velocity      = getWristVelocity(landmarks, calSideRef.current)
-          const wristStill    = velocity < VELOCITY_THRESH
-          const lockedOut     = elbowAngle >= ELBOW_LOCK_ANGLE
-          const nearChest     = elbowAngle < ELBOW_CHEST_ANGLE
-          const currentState  = calStateRef.current
+          const elbowAngle = computeElbowAngle(landmarks, calSideRef.current)
+          if (elbowAngle === null) {
+            setInstruction('Arms not visible — adjust camera')
+            animFrameRef.current = requestAnimationFrame(loop)
+            return
+          }
+
+          const velocity   = getWristVelocity(landmarks, calSideRef.current)
+          const wristStill = velocity < VELOCITY_THRESH
+          const lockedOut  = elbowAngle >= ELBOW_LOCK_ANGLE
+          const nearChest  = elbowAngle < ELBOW_CHEST_ANGLE
 
           const shoulder = landmarks[`${calSideRef.current}_shoulder`]
           const wrist    = landmarks[`${calSideRef.current}_wrist`]
           const armDist  = euclideanDistance(shoulder, wrist)
 
-          // ── State transitions ─────────────────────────────────────────────
+          const currentState = calStateRef.current
+
+          // ── State machine ──────────────────────────────────────────────
 
           if (currentState === CalState.WAITING) {
             setInstruction('Lock out your arms to begin')
+
             if (lockedOut) {
-              calStateRef.current = CalState.LOCKOUT
+              calStateRef.current   = CalState.LOCKOUT
               holdFramesRef.current = 0
             }
 
@@ -142,11 +170,19 @@ export default function CalibrationScreen() {
               setInstruction(`Hold… ${Math.round(prog * 100)}%`)
 
               if (holdFramesRef.current >= HOLD_FRAMES) {
-                // Record lockout distance for this rep
+                // Record lockout measurement
                 lockoutSamplesRef.current.push(armDist)
-                holdFramesRef.current  = 0
+
+                // Fire START command
+                if (!startFiredRef.current) {
+                  speakCommand('start')
+                  startFiredRef.current = true
+                }
+
+                holdFramesRef.current   = 0
                 wristHistoryRef.current = []
-                calStateRef.current    = CalState.DESCENDING
+                pressFiredRef.current   = false
+                calStateRef.current     = CalState.DESCENDING
                 setProgress(0)
                 setInstruction('Lower bar to chest')
               }
@@ -156,6 +192,7 @@ export default function CalibrationScreen() {
 
           } else if (currentState === CalState.DESCENDING) {
             setInstruction('Lower bar to chest')
+
             if (nearChest && wristStill) {
               calStateRef.current   = CalState.CHEST
               holdFramesRef.current = 0
@@ -163,7 +200,6 @@ export default function CalibrationScreen() {
 
           } else if (currentState === CalState.CHEST) {
             if (!nearChest) {
-              // bar moved back up before we confirmed — go back
               calStateRef.current   = CalState.DESCENDING
               holdFramesRef.current = 0
             } else if (wristStill) {
@@ -173,11 +209,18 @@ export default function CalibrationScreen() {
               setInstruction(`Hold at chest… ${Math.round(prog * 100)}%`)
 
               if (holdFramesRef.current >= HOLD_FRAMES) {
-                // Record chest distance for this rep
+                // Record chest measurement
                 chestSamplesRef.current.push(armDist)
-                holdFramesRef.current  = 0
+
+                // Fire PRESS command
+                if (!pressFiredRef.current) {
+                  speakCommand('press')
+                  pressFiredRef.current = true
+                }
+
+                holdFramesRef.current   = 0
                 wristHistoryRef.current = []
-                calStateRef.current    = CalState.ASCENDING
+                calStateRef.current     = CalState.ASCENDING
                 setProgress(0)
                 setInstruction('Press back up to lockout')
               }
@@ -187,39 +230,51 @@ export default function CalibrationScreen() {
 
           } else if (currentState === CalState.ASCENDING) {
             setInstruction('Press back up to lockout')
+
             if (lockedOut) {
               const newRepCount = repCountRef.current + 1
               repCountRef.current = newRepCount
               setRepCount(newRepCount)
 
               if (newRepCount >= TOTAL_REPS) {
-                // All reps done — compute averages and save
-                const avgExtended = lockoutSamplesRef.current.reduce((a, b) => a + b, 0)
-                                    / lockoutSamplesRef.current.length
-                const avgBent     = chestSamplesRef.current.reduce((a, b) => a + b, 0)
-                                    / chestSamplesRef.current.length
-                const chestRatio  = avgBent / avgExtended
+                // All reps done — compute averages
+                const avgExtended = lockoutSamplesRef.current
+                  .reduce((a, b) => a + b, 0) / lockoutSamplesRef.current.length
+
+                const avgBent = chestSamplesRef.current
+                  .reduce((a, b) => a + b, 0) / chestSamplesRef.current.length
+
+                const chestRatio = avgBent / avgExtended
 
                 saveCalibration(liftId, view, {
                   chestRatio,
                   armExtendedDistance: avgExtended,
+                  side: calSideRef.current,
                 })
+
+                // Fire RACK command
+                speakCommand('rack')
 
                 setSavedRatio(chestRatio)
                 calStateRef.current = CalState.DONE
                 setUiState(CalState.DONE)
 
-                console.log(`[Cal] Done. ratio=${chestRatio.toFixed(3)}, extended=${avgExtended.toFixed(3)}`)
+                console.log(
+                  `[Cal] Done. ratio=${chestRatio.toFixed(3)},` +
+                  ` extended=${avgExtended.toFixed(3)},` +
+                  ` side=${calSideRef.current}`
+                )
               } else {
-                // More reps needed
-                calStateRef.current   = CalState.LOCKOUT
-                holdFramesRef.current = 0
+                // More reps — reset flags for next rep
+                startFiredRef.current   = false
+                pressFiredRef.current   = false
+                calStateRef.current     = CalState.LOCKOUT
+                holdFramesRef.current   = 0
                 wristHistoryRef.current = []
               }
             }
           }
 
-          // Sync UI state for instruction panel
           setUiState(calStateRef.current)
 
         } else {
@@ -231,7 +286,7 @@ export default function CalibrationScreen() {
     }
 
     loop()
-  }, [getWristVelocity, liftId, view])
+  }, [getWristVelocity, liftId, view, angle])
 
   // ── Load MediaPipe + camera ───────────────────────────────────────────────
   useEffect(() => {
@@ -239,9 +294,12 @@ export default function CalibrationScreen() {
 
     const start = async () => {
       try {
+        await initAudio()
+
         const vision = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
         )
+
         poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task',
@@ -254,8 +312,9 @@ export default function CalibrationScreen() {
         if (cancelled) return
 
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user' }
+          video: { facingMode: 'environment' }
         })
+
         const video = videoRef.current
         if (video && !cancelled) {
           video.srcObject = stream
@@ -280,12 +339,26 @@ export default function CalibrationScreen() {
   }, [runLoop])
 
   // ── Navigation ────────────────────────────────────────────────────────────
-  const goToCamera = () => {
-    navigate(`/angle/${liftId}`)
-  } 
+  const goToCamera = () => navigate(`/angle/${liftId}`)
 
-  const skipCalibration = () => {
-    navigate(`/angle/${liftId}`)
+  const skipCalibration = () => navigate(`/angle/${liftId}`)
+
+  const redoCalibration = () => {
+    repCountRef.current       = 0
+    lockoutSamplesRef.current = []
+    chestSamplesRef.current   = []
+    calSideRef.current        = null
+    holdFramesRef.current     = 0
+    wristHistoryRef.current   = []
+    startFiredRef.current     = false
+    pressFiredRef.current     = false
+    calStateRef.current       = CalState.WAITING
+    smootherRef.current.reset()
+    setRepCount(0)
+    setProgress(0)
+    setUiState(CalState.WAITING)
+    setSavedRatio(null)
+    setInstruction('Lock out your arms to begin')
   }
 
   // ── DONE screen ───────────────────────────────────────────────────────────
@@ -306,20 +379,7 @@ export default function CalibrationScreen() {
           <button style={styles.primaryBtn} onClick={goToCamera}>
             Start Lifting
           </button>
-          <button style={styles.skipBtn} onClick={() => {
-            // Redo calibration
-            repCountRef.current       = 0
-            lockoutSamplesRef.current = []
-            chestSamplesRef.current   = []
-            calSideRef.current        = null
-            holdFramesRef.current     = 0
-            wristHistoryRef.current   = []
-            calStateRef.current       = CalState.WAITING
-            setRepCount(0)
-            setProgress(0)
-            setUiState(CalState.WAITING)
-            setSavedRatio(null)
-          }}>
+          <button style={styles.skipBtn} onClick={redoCalibration}>
             Redo calibration
           </button>
         </div>
@@ -342,7 +402,6 @@ export default function CalibrationScreen() {
       </div>
 
       <div style={styles.infoPanel}>
-        {/* Header */}
         <div style={styles.headerRow}>
           <div>
             <p style={styles.stepLabel}>
@@ -354,22 +413,19 @@ export default function CalibrationScreen() {
           </div>
           {existingCal && (
             <p style={styles.existingLabel}>
-              Existing cal: {(existingCal.chestRatio * 100).toFixed(1)}%
+              Existing: {(existingCal.chestRatio * 100).toFixed(1)}%
             </p>
           )}
         </div>
 
-        {/* Instruction */}
         <p style={styles.instructionText}>{instruction}</p>
 
-        {/* Progress bar — shows during holds */}
         {progress > 0 && (
           <div style={styles.progressTrack}>
             <div style={{ ...styles.progressFill, width: `${progress * 100}%` }} />
           </div>
         )}
 
-        {/* Rep dots */}
         <div style={styles.repDots}>
           {Array.from({ length: TOTAL_REPS }).map((_, i) => (
             <div
