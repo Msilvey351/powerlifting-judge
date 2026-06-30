@@ -1,8 +1,8 @@
 // src/screens/CalibrationScreen.jsx
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate, useParams }                   from 'react-router-dom'
-import { PoseLandmarker, FilesetResolver }          from '@mediapipe/tasks-vision'
-import { DrawingUtils }                             from '@mediapipe/tasks-vision'
+import { PoseLandmarker, FilesetResolver,
+         DrawingUtils }                             from '@mediapipe/tasks-vision'
 import { extractLandmarks, euclideanDistance,
          benchPickBestSide, computeElbowAngle,
          LandmarkSmoother }                         from '../logic/poseUtils'
@@ -10,14 +10,12 @@ import { drawRelevantVisiblePose }                  from '../logic/drawingPolicy
 import { saveCalibration, getCalibration }          from '../logic/calibrationStore'
 import { speakCommand, initAudio }                  from '../logic/audio'
 
-// ── Constants ─────────────────────────────────────────────────────────────────
 const TOTAL_REPS        = 3
 const HOLD_FRAMES       = 20
 const VELOCITY_THRESH   = 0.005
 const ELBOW_LOCK_ANGLE  = 155
 const ELBOW_CHEST_ANGLE = 110
 
-// ── Calibration states ────────────────────────────────────────────────────────
 const CalState = {
   LOADING:    'LOADING',
   WAITING:    'WAITING',
@@ -39,6 +37,7 @@ export default function CalibrationScreen() {
   const poseLandmarkerRef = useRef(null)
   const animFrameRef      = useRef(null)
   const smootherRef       = useRef(new LandmarkSmoother(6))
+  const streamRef         = useRef(null)
 
   // ── Calibration data refs ─────────────────────────────────────────────────
   const calStateRef       = useRef(CalState.LOADING)
@@ -48,9 +47,6 @@ export default function CalibrationScreen() {
   const chestSamplesRef   = useRef([])
   const repCountRef       = useRef(0)
   const calSideRef        = useRef(null)
-
-  // Tracks whether start/press/rack have fired for current rep
-  // to avoid repeat commands
   const startFiredRef     = useRef(false)
   const pressFiredRef     = useRef(false)
 
@@ -62,6 +58,7 @@ export default function CalibrationScreen() {
   const [cameraError,  setCameraError] = useState(null)
   const [existingCal,  setExistingCal] = useState(null)
   const [savedRatio,   setSavedRatio]  = useState(null)
+  const [facingMode,   setFacingMode]  = useState('environment')
 
   useEffect(() => {
     const cal = getCalibration(liftId, view)
@@ -79,6 +76,14 @@ export default function CalibrationScreen() {
     const prev = hist[hist.length - 2]
     const curr = hist[hist.length - 1]
     return Math.sqrt((curr.x - prev.x) ** 2 + (curr.y - prev.y) ** 2)
+  }, [])
+
+  // ── Stop stream ───────────────────────────────────────────────────────────
+  const stopCurrentStream = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop())
+      streamRef.current = null
+    }
   }, [])
 
   // ── Main detection loop ───────────────────────────────────────────────────
@@ -104,22 +109,19 @@ export default function CalibrationScreen() {
           const landmarks = smootherRef.current.smooth(extractLandmarks(raw))
           const side      = benchPickBestSide(landmarks)
 
-          // Build a minimal update object for drawing policy
-          // so drawRelevantVisiblePose knows the locked side
           const drawUpdate = {
             side,
             lockedSide: calSideRef.current,
           }
 
-          // Draw only relevant visible joints for bench
           drawRelevantVisiblePose({
             drawingUtils,
-            rawLandmarks: raw,
-            liftId:       'bench',
+            rawLandmarks:        raw,
+            liftId:              'bench',
             angle,
-            update:       drawUpdate,
-            landmarkStyle:  { color: '#FF0000', lineWidth: 1, radius: 3 },
-            connectorStyle: { color: '#00FF00', lineWidth: 2 },
+            update:              drawUpdate,
+            landmarkStyle:       { color: '#FF0000', lineWidth: 1, radius: 3 },
+            connectorStyle:      { color: '#00FF00', lineWidth: 2 },
             visibilityThreshold: 0.4,
           })
 
@@ -149,11 +151,8 @@ export default function CalibrationScreen() {
 
           const currentState = calStateRef.current
 
-          // ── State machine ──────────────────────────────────────────────
-
           if (currentState === CalState.WAITING) {
             setInstruction('Lock out your arms to begin')
-
             if (lockedOut) {
               calStateRef.current   = CalState.LOCKOUT
               holdFramesRef.current = 0
@@ -170,10 +169,8 @@ export default function CalibrationScreen() {
               setInstruction(`Hold… ${Math.round(prog * 100)}%`)
 
               if (holdFramesRef.current >= HOLD_FRAMES) {
-                // Record lockout measurement
                 lockoutSamplesRef.current.push(armDist)
 
-                // Fire START command
                 if (!startFiredRef.current) {
                   speakCommand('start')
                   startFiredRef.current = true
@@ -192,7 +189,6 @@ export default function CalibrationScreen() {
 
           } else if (currentState === CalState.DESCENDING) {
             setInstruction('Lower bar to chest')
-
             if (nearChest && wristStill) {
               calStateRef.current   = CalState.CHEST
               holdFramesRef.current = 0
@@ -209,10 +205,8 @@ export default function CalibrationScreen() {
               setInstruction(`Hold at chest… ${Math.round(prog * 100)}%`)
 
               if (holdFramesRef.current >= HOLD_FRAMES) {
-                // Record chest measurement
                 chestSamplesRef.current.push(armDist)
 
-                // Fire PRESS command
                 if (!pressFiredRef.current) {
                   speakCommand('press')
                   pressFiredRef.current = true
@@ -237,13 +231,10 @@ export default function CalibrationScreen() {
               setRepCount(newRepCount)
 
               if (newRepCount >= TOTAL_REPS) {
-                // All reps done — compute averages
                 const avgExtended = lockoutSamplesRef.current
                   .reduce((a, b) => a + b, 0) / lockoutSamplesRef.current.length
-
                 const avgBent = chestSamplesRef.current
                   .reduce((a, b) => a + b, 0) / chestSamplesRef.current.length
-
                 const chestRatio = avgBent / avgExtended
 
                 saveCalibration(liftId, view, {
@@ -252,9 +243,7 @@ export default function CalibrationScreen() {
                   side: calSideRef.current,
                 })
 
-                // Fire RACK command
                 speakCommand('rack')
-
                 setSavedRatio(chestRatio)
                 calStateRef.current = CalState.DONE
                 setUiState(CalState.DONE)
@@ -265,7 +254,6 @@ export default function CalibrationScreen() {
                   ` side=${calSideRef.current}`
                 )
               } else {
-                // More reps — reset flags for next rep
                 startFiredRef.current   = false
                 pressFiredRef.current   = false
                 calStateRef.current     = CalState.LOCKOUT
@@ -288,11 +276,70 @@ export default function CalibrationScreen() {
     loop()
   }, [getWristVelocity, liftId, view, angle])
 
-  // ── Load MediaPipe + camera ───────────────────────────────────────────────
+  // ── Start camera ──────────────────────────────────────────────────────────
+  const startCamera = useCallback(async (preferredFacingMode = 'environment') => {
+    stopCurrentStream()
+
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current)
+      animFrameRef.current = null
+    }
+
+    setCameraError(null)
+
+    const attempts = [
+      { video: { facingMode: { exact: preferredFacingMode } } },
+      { video: { facingMode: preferredFacingMode } },
+      { video: { facingMode: preferredFacingMode === 'user' ? 'environment' : 'user' } },
+      { video: true },
+    ]
+
+    let lastError = null
+
+    for (const constraints of attempts) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints)
+        streamRef.current = stream
+
+        const actualFacingMode =
+          stream.getVideoTracks()[0]?.getSettings?.().facingMode
+
+        if (actualFacingMode === 'user' || actualFacingMode === 'environment') {
+          setFacingMode(actualFacingMode)
+        } else {
+          setFacingMode(preferredFacingMode)
+        }
+
+        const video = videoRef.current
+        if (video) {
+          video.srcObject = stream
+          await video.play()
+
+          // Only reset state if not already mid-calibration
+          if (calStateRef.current === CalState.LOADING ||
+              calStateRef.current === CalState.WAITING) {
+            calStateRef.current = CalState.WAITING
+            setUiState(CalState.WAITING)
+            setInstruction('Lock out your arms to begin')
+          }
+
+          runLoop()
+        }
+
+        return
+      } catch (err) {
+        lastError = err
+      }
+    }
+
+    setCameraError(lastError?.name + ': ' + lastError?.message)
+  }, [stopCurrentStream, runLoop])
+
+  // ── Load MediaPipe then camera ────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false
 
-    const start = async () => {
+    const load = async () => {
       try {
         await initAudio()
 
@@ -309,39 +356,33 @@ export default function CalibrationScreen() {
           numPoses: 1,
         })
 
-        if (cancelled) return
-
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment' }
-        })
-
-        const video = videoRef.current
-        if (video && !cancelled) {
-          video.srcObject = stream
-          await video.play()
-          calStateRef.current = CalState.WAITING
-          setUiState(CalState.WAITING)
-          setInstruction('Lock out your arms to begin')
-          runLoop()
+        if (!cancelled) {
+          await startCamera('environment')
         }
       } catch (err) {
-        setCameraError(err.message)
+        if (!cancelled) setCameraError(err.message)
       }
     }
 
-    start()
+    load()
 
     return () => {
       cancelled = true
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current)
       if (poseLandmarkerRef.current) poseLandmarkerRef.current.close()
+      stopCurrentStream()
     }
-  }, [runLoop])
+  }, [startCamera, stopCurrentStream])
 
-  // ── Navigation ────────────────────────────────────────────────────────────
+  // ── Handlers ──────────────────────────────────────────────────────────────
   const goToCamera = () => navigate(`/angle/${liftId}`)
 
   const skipCalibration = () => navigate(`/angle/${liftId}`)
+
+  const handleSwitchCamera = async () => {
+    const next = facingMode === 'user' ? 'environment' : 'user'
+    await startCamera(next)
+  }
 
   const redoCalibration = () => {
     repCountRef.current       = 0
@@ -411,11 +452,20 @@ export default function CalibrationScreen() {
               Rep {Math.min(repCount + 1, TOTAL_REPS)} of {TOTAL_REPS}
             </p>
           </div>
-          {existingCal && (
-            <p style={styles.existingLabel}>
-              Existing: {(existingCal.chestRatio * 100).toFixed(1)}%
-            </p>
-          )}
+
+          <div style={styles.headerRight}>
+            {existingCal && (
+              <p style={styles.existingLabel}>
+                Existing: {(existingCal.chestRatio * 100).toFixed(1)}%
+              </p>
+            )}
+            <button
+              onClick={handleSwitchCamera}
+              style={styles.switchCameraBtn}
+            >
+              {facingMode === 'user' ? 'Back Camera' : 'Front Camera'}
+            </button>
+          </div>
         </div>
 
         <p style={styles.instructionText}>{instruction}</p>
@@ -459,9 +509,11 @@ const styles = {
   canvas:          { position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' },
   infoPanel:       { padding: '20px 24px 28px', background: '#111', flexShrink: 0 },
   headerRow:       { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' },
+  headerRight:     { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px' },
   stepLabel:       { fontSize: '12px', color: '#888', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '2px' },
   repCounter:      { fontSize: '15px', fontWeight: '600' },
   existingLabel:   { fontSize: '12px', color: '#555' },
+  switchCameraBtn: { fontSize: '12px', color: '#fff', background: '#222', border: '1px solid #444', borderRadius: '8px', padding: '6px 10px', cursor: 'pointer', whiteSpace: 'nowrap' },
   instructionText: { fontSize: '22px', fontWeight: '600', marginBottom: '16px' },
   progressTrack:   { height: '6px', background: '#333', borderRadius: '3px', overflow: 'hidden', marginBottom: '16px' },
   progressFill:    { height: '100%', background: '#4CAF50', transition: 'width 0.1s linear' },
