@@ -866,7 +866,7 @@ export class BenchReferee {
     this.ELBOW_LOCK_ENTER      = 160
     this.ELBOW_LOCK_EXIT       = 150
 
-    this.CHEST_RATIO_TOLERANCE = 0.06
+    this.CHEST_RATIO_TOLERANCE = 0.08
     this.VELOCITY_THRESHOLD    = 0.004
     this.LOCKOUT_HOLD_FRAMES   = 20
     this.CHEST_HOLD_FRAMES     = 15
