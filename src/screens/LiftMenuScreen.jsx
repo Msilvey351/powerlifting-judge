@@ -15,6 +15,10 @@ function LiftMenuScreen() {
     navigate('/velocity-setup')
   }
 
+  const handleVideoAnalysis = () => {
+    navigate('/video-analysis')
+  }
+
   return (
     <div style={styles.container}>
       <div style={styles.header}>
@@ -33,16 +37,34 @@ function LiftMenuScreen() {
 
         <button
           onClick={handleVelocitySetup}
-          style={styles.velocityButton}
+          style={styles.secondaryButton}
           onMouseEnter={e => e.currentTarget.style.background = '#2a2a2a'}
           onMouseLeave={e => e.currentTarget.style.background = '#1a1a1a'}
         >
           <div>
-            <p style={styles.velocityTitle}>Velocity Setup</p>
-            <p style={styles.velocitySubtitle}>
+            <p style={styles.secondaryTitle}>Velocity Setup</p>
+            <p style={styles.secondarySubtitle}>
               {profile?.heightCm
                 ? `Height saved: ${profile.heightCm} cm — estimated m/s enabled`
                 : 'Enter height to estimate velocity in m/s'}
+            </p>
+          </div>
+          <span style={styles.arrow}>›</span>
+        </button>
+
+        <button
+          onClick={handleVideoAnalysis}
+          style={{
+            ...styles.secondaryButton,
+            border: '1px solid #2a2a2a',
+          }}
+          onMouseEnter={e => e.currentTarget.style.background = '#2a2a2a'}
+          onMouseLeave={e => e.currentTarget.style.background = '#1a1a1a'}
+        >
+          <div>
+            <p style={styles.secondaryTitle}>Video Analysis</p>
+            <p style={styles.secondarySubtitle}>
+              Upload a video to judge — dev tool
             </p>
           </div>
           <span style={styles.arrow}>›</span>
@@ -77,7 +99,7 @@ const styles = {
     flexDirection: 'column',
     gap:           '12px',
   },
-  velocityButton: {
+  secondaryButton: {
     display:        'flex',
     justifyContent: 'space-between',
     alignItems:     'center',
@@ -90,13 +112,13 @@ const styles = {
     textAlign:      'left',
     cursor:         'pointer',
   },
-  velocityTitle: {
+  secondaryTitle: {
     fontSize:     '18px',
     fontWeight:   '500',
     marginBottom: '4px',
     color:        '#fff',
   },
-  velocitySubtitle: {
+  secondarySubtitle: {
     fontSize: '13px',
     color:    '#888',
   },
