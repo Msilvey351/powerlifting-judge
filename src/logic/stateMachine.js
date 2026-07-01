@@ -862,7 +862,6 @@ export class BenchReferee {
     calibration = null,
     userProfile = null
   ) {
-    // Fix 2: hysteresis on elbow lockout
     this.ELBOW_LOCK_ENTER      = 160
     this.ELBOW_LOCK_EXIT       = 150
 
@@ -893,6 +892,7 @@ export class BenchReferee {
 
     this._lockoutFrames       = 0
     this._chestFrames         = 0
+    this._descendFrames       = 0
     this._elbowAngleHistory   = []
     this._wristHistory        = []
 
@@ -902,7 +902,6 @@ export class BenchReferee {
     this._startCommandFired   = false
     this._chestReached        = false
 
-    // Fix 2: hysteresis state for elbow lockout
     this._elbowLockedHyst     = false
 
     this._velocityTracker     = new ConcentricVelocityTracker()
@@ -918,6 +917,7 @@ export class BenchReferee {
     this._faults              = []
     this._lockoutFrames       = 0
     this._chestFrames         = 0
+    this._descendFrames       = 0
     this._elbowAngleHistory   = []
     this._wristHistory        = []
 
@@ -975,13 +975,6 @@ export class BenchReferee {
     if (this._elbowAngleHistory.length > 8) this._elbowAngleHistory.shift()
   }
 
-  _elbowAtLocalMinimum() {
-    const h = this._elbowAngleHistory
-    if (h.length < 4) return false
-    const minPrev = Math.min(...h.slice(0, -1))
-    return h[h.length - 1] > minPrev + 3
-  }
-
   _getSide(landmarks) {
     const detectedSide = benchPickBestSide(landmarks)
     if (this._lockedSide) return this._lockedSide
@@ -1002,9 +995,9 @@ export class BenchReferee {
     }
   }
 
-  _isAtChest(landmarks, side, elbowAngle, wristVelocity) {
-    const wristStill = wristVelocity < this.VELOCITY_THRESHOLD
-
+  // Pure position check — no stillness requirement
+  // Stillness is handled separately in the CHEST state
+  _isAtChest(landmarks, side, elbowAngle) {
     if (this.calibration) {
       const calSide  = this.calibration.side || side
       const shoulder = landmarks[`${calSide}_shoulder`]
@@ -1014,15 +1007,12 @@ export class BenchReferee {
         const currentRatio =
           euclideanDistance(shoulder, wrist) / this.calibration.armExtendedDistance
 
-        return (
-          currentRatio <= this.calibration.chestRatio + this.CHEST_RATIO_TOLERANCE &&
-          wristStill &&
-          this._elbowAtLocalMinimum()
-        )
+        return currentRatio <= this.calibration.chestRatio + this.CHEST_RATIO_TOLERANCE
       }
     }
 
-    return elbowAngle < 100 && wristStill && this._elbowAtLocalMinimum()
+    // Fallback — no calibration
+    return elbowAngle < 100
   }
 
   _getBenchVelocityY(landmarks, side, barY = null) {
@@ -1062,7 +1052,6 @@ export class BenchReferee {
     const wristVelocity = this._updateWristHistory(landmarks, side)
     const wristStill    = wristVelocity < this.VELOCITY_THRESHOLD
 
-    // Fix 2: hysteresis on elbow lockout
     this._elbowLockedHyst = updateHysteresis(
       this._elbowLockedHyst,
       elbowAngle,
@@ -1073,7 +1062,8 @@ export class BenchReferee {
 
     this._updateElbowHistory(elbowAngle)
 
-    const atChest = this._isAtChest(landmarks, side, elbowAngle, wristVelocity)
+    // Pure position check — no stillness or local minimum requirement
+    const atChest = this._isAtChest(landmarks, side, elbowAngle)
 
     this._latestScale = estimateMetresPerNormUnit(
       'bench', this.angle, landmarks, side, this.userProfile
@@ -1102,9 +1092,10 @@ export class BenchReferee {
       }
 
     } else if (this.state === BenchState.LOCKOUT) {
+
       if (this._pendingCompletion) {
         if (lockedOut) {
-          if (wristStill){
+          if (wristStill) {
             this._lockoutFrames++
           }
 
@@ -1121,12 +1112,12 @@ export class BenchReferee {
               this.state = BenchState.LOCKOUT
             }
           }
-        } 
+        }
 
       } else if (!this._repInProgress && this.currentRep < this.totalReps) {
         if (lockedOut && !this._startCommandFired) {
-          if (wristStill){
-            this._lockoutFrames++            
+          if (wristStill) {
+            this._lockoutFrames++
           }
 
           if (this._lockoutFrames >= this.LOCKOUT_HOLD_FRAMES) {
@@ -1143,6 +1134,7 @@ export class BenchReferee {
           this._pressCommandFired = false
           this._lockoutFrames     = 0
           this._chestFrames       = 0
+          this._descendFrames     = 0
           this._elbowAngleHistory = []
           this._wristHistory      = []
           this.state              = BenchState.DESCENDING
@@ -1150,13 +1142,16 @@ export class BenchReferee {
       }
 
     } else if (this.state === BenchState.DESCENDING) {
+      this._descendFrames++
+
       if (atChest) {
         this._chestReached = true
         this._chestFrames  = 0
         this.state         = BenchState.CHEST
       }
 
-      if (lockedOut && this._repInProgress && !this._chestReached) {
+      // Only fault if clearly descended and returned without reaching chest
+      if (lockedOut && this._repInProgress && !this._chestReached && this._descendFrames > 15) {
         this._addFault('Bar did not reach chest')
         this._pendingCompletion = true
         this._lockoutFrames     = 0
@@ -1165,15 +1160,18 @@ export class BenchReferee {
 
     } else if (this.state === BenchState.CHEST) {
       if (atChest) {
+        // Accumulate still frames — never decrement on wobble
         if (wristStill) {
           this._chestFrames++
         }
+
         if (this._chestFrames >= this.CHEST_HOLD_FRAMES && !this._pressCommandFired) {
           this._giveCommand('press')
           this._pressCommandFired = true
         }
 
-      } else if (!wristStill) {
+      } else {
+        // Bar has left chest position — transition to pressing
         const y = this._getBenchVelocityY(landmarks, side, barY)
         this._velocityTracker.start(y)
 
