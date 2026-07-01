@@ -868,9 +868,9 @@ export class BenchReferee {
 
     this.CHEST_RATIO_TOLERANCE = 0.08
     this.VELOCITY_THRESHOLD    = 0.012
-    this.LOCKOUT_HOLD_FRAMES   = 20
-    this.CHEST_HOLD_FRAMES     = 15
-    this.SETUP_HOLD_FRAMES     = 25
+    this.LOCKOUT_HOLD_FRAMES   = 10
+    this.CHEST_HOLD_FRAMES     = 10
+    this.SETUP_HOLD_FRAMES     = 10
 
     this.onCommand   = onCommand
     this.totalReps   = totalReps
