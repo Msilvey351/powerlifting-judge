@@ -869,7 +869,7 @@ export class BenchReferee {
     this.CHEST_RATIO_TOLERANCE = 0.08
     this.VELOCITY_THRESHOLD    = 0.012
     this.LOCKOUT_HOLD_FRAMES   = 10
-    this.CHEST_HOLD_FRAMES     = 10
+    this.CHEST_HOLD_FRAMES     = 6
     this.SETUP_HOLD_FRAMES     = 10
 
     this.onCommand   = onCommand
@@ -1103,8 +1103,10 @@ export class BenchReferee {
 
     } else if (this.state === BenchState.LOCKOUT) {
       if (this._pendingCompletion) {
-        if (lockedOut && wristStill) {
-          this._lockoutFrames++
+        if (lockedOut) {
+          if (wristStill){
+            this._lockoutFrames++
+          }
 
           if (this._lockoutFrames >= this.LOCKOUT_HOLD_FRAMES) {
             this._pendingCompletion = false
@@ -1119,13 +1121,13 @@ export class BenchReferee {
               this.state = BenchState.LOCKOUT
             }
           }
-        } else {
-          this._lockoutFrames = Math.max(0, this._lockoutFrames - 1)
-        }
+        } 
 
       } else if (!this._repInProgress && this.currentRep < this.totalReps) {
-        if (lockedOut && wristStill && !this._startCommandFired) {
-          this._lockoutFrames++
+        if (lockedOut && !this._startCommandFired) {
+          if (wristStill){
+            this._lockoutFrames++            
+          }
 
           if (this._lockoutFrames >= this.LOCKOUT_HOLD_FRAMES) {
             this._giveCommand('start')
@@ -1162,15 +1164,16 @@ export class BenchReferee {
       }
 
     } else if (this.state === BenchState.CHEST) {
-      if (atChest && wristStill) {
-        this._chestFrames++
-
+      if (atChest) {
+        if (wristStill) {
+          this._chestFrames++
+        }
         if (this._chestFrames >= this.CHEST_HOLD_FRAMES && !this._pressCommandFired) {
           this._giveCommand('press')
           this._pressCommandFired = true
         }
 
-      } else if (!atChest && !wristStill) {
+      } else if (!wristStill) {
         const y = this._getBenchVelocityY(landmarks, side, barY)
         this._velocityTracker.start(y)
 
